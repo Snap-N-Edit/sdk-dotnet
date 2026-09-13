@@ -146,6 +146,87 @@ an error.
 
 ---
 
+## What a job cost
+
+Every job response — `CreateJobResult`, `JobView` and `RunResult` all share the
+same envelope — reports its own attribution, the three facts `GET /usage`
+aggregates:
+
+| | |
+| --- | --- |
+| `CreditCost` | Credits actually debited. 0 for a free operation, a cache hit, a delivery-only clone, or an unmetered website session. Debited at creation, refunded in full if the job ends `Failed`. |
+| `Cached` | The result came out of the result cache: no model ran, nothing was billed. `CreateJobResult.WasCacheHit` reads this flag, falling back to the `200`-not-`202` status. |
+| `DeliveryOnly` | The row exists only to deliver an already-cached result to your bucket — cached and free, but still worth polling for `Delivery`. |
+
+```csharp
+var job = await client.CreateJobAsync(Operations.Upscale, JobInput.FromAssetId(assetId));
+Console.WriteLine(job.CreditCost);   // 2
+Console.WriteLine(job.Cached);       // false
+
+var again = await client.CreateJobAsync(Operations.Upscale, JobInput.FromAssetId(assetId));
+Console.WriteLine(again.Cached);     // true — a new JobId, the same result, billed 0
+Console.WriteLine(again.CreditCost); // 0
+```
+
+---
+
+## Usage and credits
+
+`GetUsageAsync` is `GET /usage`: what the account ran, what it cost and where
+it came from, bucketed along **one** dimension at a time. No query means the
+last 30 days grouped by day.
+
+```csharp
+var report = await client.GetUsageAsync(new UsageQuery
+{
+    From = DateTimeOffset.UtcNow.AddDays(-7),
+    GroupBy = UsageGroupBy.Operation,
+    Source = UsageSource.Api,      // optional filters: KeyId, Origin, Operation, Source
+});
+
+Console.WriteLine(report.Totals.Jobs);           // 128 — REQUESTS, cache hits included
+Console.WriteLine(report.Totals.Credits);        // 214 — what was actually debited
+Console.WriteLine(report.Totals.CacheHits);      // 31  — served from cache, billed nothing
+Console.WriteLine(report.Totals.ActiveSessions); // 4   — embed sessions seen in the range
+
+foreach (var bucket in report.Series)
+{
+    Console.WriteLine($"{bucket.Label}: {bucket.Jobs} jobs, {bucket.Credits} credits");
+}
+
+Console.WriteLine(report.Bucket("upscale")?.Credits);   // one bucket by key
+```
+
+`From`/`To` are `DateTimeOffset`s in any offset — they go on the wire as UTC
+instants — and default to the last 30 days. A range wider than 366 days, or a
+`From` after `To`, is `ErrorCode.InvalidInput`. `GroupBy` is `Day` (zero-filled
+across the range, oldest first), `Key`, `Origin`, `Operation` or `Source`;
+everything but `Day` comes back busiest first. `Range` echoes the window the
+api actually applied, as ISO-8601 **instants** rather than days.
+
+`report.Keys` is the cap gauge — every live API key on the account with what it
+has spent **today**, whatever range you asked for:
+
+```csharp
+foreach (var key in report.Keys.Where(k => k.IsCapped && k.RemainingToday < 10))
+{
+    logger.LogWarning("{Key}: {Used}/{Limit} credits today", key.Name, key.UsedToday, key.DailyCreditLimit);
+}
+```
+
+Two things to know before writing an assertion against these numbers:
+
+- **A cache hit still creates a job.** One row per *request*, so `Totals.Jobs`
+  counts what was asked for and `Totals.CacheHits` says how many of those ran
+  no model. `POST /jobs` on a hit therefore answers a **new** `JobId` with the
+  **same** `OutputAssetId` as the job whose result it reuses — and the job says
+  so itself: `Cached == true`, `CreditCost == 0`.
+- **An embed token sees only its own key.** `KeyId` is forced to it and
+  `report.Keys` comes back empty — a page-scoped credential must not become an
+  account-wide reporting one.
+
+---
+
 ## Webhooks (ASP.NET Core)
 
 Register an endpoint URL on your account and it receives a signed POST every
@@ -273,8 +354,9 @@ A job that fails surfaces the job's own `errorCode` as `e.Code` with
 ## Operations
 
 `Operations` has a constant for each id, and a typed params record for each
-operation. A cost of 0 is free; a **cache hit is never billed** and a terminal
-failure is **refunded**.
+operation. A cost of 0 is free; a **cache hit is never billed** (it still
+records a job — a new `JobId` with the same `OutputAssetId`, reported as
+`Cached` with `CreditCost == 0`) and a terminal failure is **refunded**.
 
 | Operation | Constant | Credits | Mask | Params record |
 | --- | --- | --- | --- | --- |
@@ -323,6 +405,7 @@ runtime.
 | `CreateJobAsync` / `GetJobAsync` / `WaitForJobAsync` | The steps, separately. |
 | `UploadAsync(bytes\|JobInput, mime?, ct)` | `POST /uploads` → PUT → confirm. |
 | `ListOperationsAsync(ct)` | The live operation catalog. |
+| `GetUsageAsync(query?, ct)` | Jobs, credits and embed sessions over a range, bucketed. |
 | `Destinations.{List,Create,Update,Delete,Test,PresignUpload}Async` | Saved storage destinations. |
 | `Embed.{CreateSession,CreateToken}Async` | Embedded-editor tokens. |
 | `Designs.{Create,CreatePages,Render}Async` | Server-side design composition and rendering. |
@@ -343,8 +426,8 @@ dotnet pack -c Release
 
 The **conformance suite** is one test per scenario in the monorepo's
 `test/conformance/scenarios.json` — the language-neutral contract every
-snapnedit SDK is held to. Each test is named with its scenario id, so a changed
-scenario is a `grep` away from its test. The fixture boots
+snapnedit SDK is held to, all 25 of them. Each test is named with its scenario
+id, so a changed scenario is a `grep` away from its test. The fixture boots
 `node scripts/conformance-server.mjs` from the repo root (the real Fastify API
 and the real worker, in one process, on an ephemeral port) and terminates it
 with `SIGTERM` on teardown. It needs `npm ci && npm run build` in the monorepo

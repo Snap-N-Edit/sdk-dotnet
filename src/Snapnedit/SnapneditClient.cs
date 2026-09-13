@@ -345,7 +345,10 @@ public sealed class SnapneditClient : IDisposable
                         download,
                         settled.InputKind,
                         settled.Destination,
-                        settled.Delivery);
+                        settled.Delivery,
+                        settled.CreditCost,
+                        settled.Cached,
+                        settled.DeliveryOnly);
                 }
 
                 var fetched = await _transport
@@ -360,7 +363,10 @@ public sealed class SnapneditClient : IDisposable
                     download,
                     settled.InputKind,
                     settled.Destination,
-                    settled.Delivery);
+                    settled.Delivery,
+                    settled.CreditCost,
+                    settled.Cached,
+                    settled.DeliveryOnly);
             }
 
             case JobState.Failed:
@@ -378,8 +384,83 @@ public sealed class SnapneditClient : IDisposable
         }
     }
 
+    /// <summary>
+    /// <c>GET /usage</c> — what this account has run, what it cost and where it
+    /// came from, bucketed along ONE dimension at a time.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Everything is optional: <c>GetUsageAsync()</c> is the last 30 days
+    /// grouped by day. Every <c>POST /jobs</c> writes one row — a cache hit
+    /// included — so <see cref="UsageFacts.Jobs"/> counts REQUESTS and
+    /// <see cref="UsageFacts.CacheHits"/> says how many of them ran no model.
+    /// </para>
+    /// <para>
+    /// An EMBED token is scoped to its own key: <see cref="UsageQuery.KeyId"/>
+    /// is forced to it and <see cref="UsageReport.Keys"/> comes back empty. A
+    /// session or <c>sk_</c> caller sees the whole account.
+    /// </para>
+    /// </remarks>
+    /// <param name="query">Window, grouping and filters. <see langword="null"/> for the defaults.</param>
+    /// <param name="cancellationToken">Cancels the request.</param>
+    /// <returns>The account's usage over the resolved window.</returns>
+    /// <exception cref="SnapneditException">
+    /// <see cref="ErrorCode.Unauthorized"/> without an account credential;
+    /// <see cref="ErrorCode.InvalidInput"/> when <c>from</c> is after <c>to</c>
+    /// or the range exceeds 366 days.
+    /// </exception>
+    public async Task<UsageReport> GetUsageAsync(
+        UsageQuery? query = null,
+        CancellationToken cancellationToken = default)
+    {
+        var url = _transport.ApiUrl("/usage" + UsageQueryString(query));
+        using var response = await _transport
+            .SendJsonAsync(HttpMethod.Get, url, null, true, cancellationToken)
+            .ConfigureAwait(false);
+        return ApiParse.UsageReport(response.Root, url);
+    }
+
     /// <summary>Releases the internally created <see cref="System.Net.Http.HttpClient"/>. An injected one is left alone.</summary>
     public void Dispose() => _transport.Dispose();
+
+    /// <summary>
+    /// <c>?from=…&amp;groupBy=…</c> for a query. An unset field is DROPPED
+    /// rather than sent empty: the api distinguishes "no filter" (count
+    /// everything) from a filter, and an empty one would match nothing.
+    /// </summary>
+    private static string UsageQueryString(UsageQuery? query)
+    {
+        if (query is null)
+        {
+            return string.Empty;
+        }
+
+        var parts = new List<string>();
+        AppendUsageFilter(parts, "from", FormatInstant(query.From));
+        AppendUsageFilter(parts, "to", FormatInstant(query.To));
+        AppendUsageFilter(parts, "groupBy", query.GroupBy.HasValue ? UsageGroupBys.ToWire(query.GroupBy.Value) : null);
+        AppendUsageFilter(parts, "keyId", query.KeyId);
+        AppendUsageFilter(parts, "origin", query.Origin);
+        AppendUsageFilter(parts, "operation", query.Operation);
+        AppendUsageFilter(parts, "source", query.Source.HasValue ? UsageSources.ToWire(query.Source.Value) : null);
+        return parts.Count == 0 ? string.Empty : "?" + string.Join("&", parts);
+    }
+
+    private static void AppendUsageFilter(List<string> parts, string name, string? value)
+    {
+        if (!string.IsNullOrEmpty(value))
+        {
+            parts.Add(name + "=" + Uri.EscapeDataString(value!));
+        }
+    }
+
+    /// <summary>
+    /// An instant in the exact shape the api parses: UTC, milliseconds, <c>Z</c>.
+    /// Round-tripping <c>"o"</c> instead would emit seven fractional digits and
+    /// a numeric offset, which is a wider format than the contract promises.
+    /// </summary>
+    private static string? FormatInstant(DateTimeOffset? value) =>
+        value?.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", CultureInfo.InvariantCulture);
 
     private async Task<ResolvedInput> ResolveInputAsync(JobInput input, CancellationToken cancellationToken)
     {

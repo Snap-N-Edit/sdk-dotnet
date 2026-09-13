@@ -259,9 +259,13 @@ public sealed class ConformanceTests : IClassFixture<ConformanceServerFixture>
             JobInput.FromAssetId(asset.AssetId),
             new CreateJobOptions { TypedParams = new ResizeImageParams { Width = 4 } });
         Assert.Equal(202, created.HttpStatus);
+        // The job says so itself, not just the ledger.
+        Assert.Equal(0, created.CreditCost);
+        Assert.False(created.Cached);
         var done = await _fx.Api.WaitForJobAsync(created.JobId, FastWait());
 
         Assert.Equal(JobState.Succeeded, done.State);
+        Assert.Equal(0, done.CreditCost);
         // resize-image costs 0 and writes no ledger entry.
         Assert.Equal(before, await BalanceAsync());
     }
@@ -274,6 +278,7 @@ public sealed class ConformanceTests : IClassFixture<ConformanceServerFixture>
 
         var created = await _fx.Api.CreateJobAsync(Operations.RemoveBackground, JobInput.FromAssetId(asset.AssetId));
         Assert.Equal(202, created.HttpStatus);
+        Assert.Equal(1, created.CreditCost);
 
         // The debit lands at creation time, before the worker ever sees the job.
         Assert.Equal(before - 1, await BalanceAsync());
@@ -297,7 +302,13 @@ public sealed class ConformanceTests : IClassFixture<ConformanceServerFixture>
 
         Assert.Equal(200, second.HttpStatus);
         Assert.True(second.WasCacheHit);
+        Assert.True(second.Cached);
+        Assert.Equal(0, second.CreditCost);
+        Assert.False(first.Cached);
         Assert.Equal(JobState.Succeeded, second.Status.State);
+        // A hit still records a job — one row per REQUEST, so usage can tell
+        // what was asked for from what ran a model. A NEW id, the SAME result.
+        Assert.NotEqual(first.JobId, second.JobId);
         Assert.Equal(outputAssetId, second.Status.OutputAssetId);
         // A cache hit is never billed.
         Assert.Equal(before, await BalanceAsync());
@@ -615,6 +626,104 @@ public sealed class ConformanceTests : IClassFixture<ConformanceServerFixture>
         Assert.Equal(TopLevelKeys(anonymous.Json), TopLevelKeys(neverExisted.Json));
     }
 
+    /* ---------------- usage ---------------- */
+
+    [Fact(DisplayName = "usage.query")]
+    public async Task UsageQuery()
+    {
+        // Two real jobs, one paid and one free, so the assertions below are
+        // about traffic this scenario produced. Unique bytes: a cache hit is
+        // free and would never move `credits`.
+        var paidAsset = await UniqueUploadAsync("usage-paid");
+        var paid = await _fx.Api.CreateJobAsync(Operations.Upscale, JobInput.FromAssetId(paidAsset.AssetId));
+        Assert.Equal(202, paid.HttpStatus);
+        Assert.Equal(JobState.Succeeded, (await _fx.Api.WaitForJobAsync(paid.JobId, FastWait())).State);
+
+        var freeAsset = await UniqueUploadAsync("usage-free");
+        var free = await _fx.Api.CreateJobAsync(
+            Operations.ResizeImage,
+            JobInput.FromAssetId(freeAsset.AssetId),
+            new CreateJobOptions { TypedParams = new ResizeImageParams { Width = 4 } });
+        Assert.Equal(202, free.HttpStatus);
+        Assert.Equal(JobState.Succeeded, (await _fx.Api.WaitForJobAsync(free.JobId, FastWait())).State);
+
+        var byOperation = await _fx.Api.GetUsageAsync(new UsageQuery { GroupBy = UsageGroupBy.Operation });
+
+        Assert.True(DateTimeOffset.TryParse(
+            byOperation.Range.From,
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.RoundtripKind,
+            out var rangeFrom));
+        Assert.True(DateTimeOffset.TryParse(
+            byOperation.Range.To,
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.RoundtripKind,
+            out var rangeTo));
+        Assert.True(rangeFrom <= rangeTo);
+        Assert.Equal(UsageGroupBy.Operation, byOperation.GroupBy);
+
+        // Every scenario shares one seeded account and they run in any order,
+        // so these are LOWER BOUNDS — never equalities.
+        Assert.True(byOperation.Totals.Jobs >= 2, "totals.jobs was " + byOperation.Totals.Jobs);
+        Assert.True(byOperation.Totals.Credits >= 2, "totals.credits was " + byOperation.Totals.Credits);
+        Assert.True(byOperation.Totals.Free >= 1, "totals.free was " + byOperation.Totals.Free);
+        foreach (var counter in new[]
+                 {
+                     byOperation.Totals.CacheHits, byOperation.Totals.Failed, byOperation.Totals.Delivered,
+                     byOperation.Totals.DeliveryFailed, byOperation.Totals.Sessions,
+                     byOperation.Totals.ActiveSessions,
+                 })
+        {
+            Assert.True(counter >= 0);
+        }
+
+        var upscale = byOperation.Bucket("upscale");
+        var resize = byOperation.Bucket("resize-image");
+        Assert.NotNull(upscale);
+        Assert.NotNull(resize);
+        // A bucket's credits is jobs x cost, so with N upscales the honest
+        // assertion is "a multiple of 2, at least 2".
+        Assert.True(upscale!.Credits >= 2, "upscale credits was " + upscale.Credits);
+        Assert.Equal(0, upscale.Credits % 2);
+        Assert.Equal(0, resize!.Credits);
+        foreach (var entry in byOperation.Series)
+        {
+            Assert.False(string.IsNullOrEmpty(entry.Key));
+            Assert.False(string.IsNullOrEmpty(entry.Label));
+            Assert.True(entry.Jobs >= 0 && entry.Credits >= 0 && entry.CacheHits >= 0 && entry.Free >= 0);
+            Assert.True(entry.Failed >= 0 && entry.Delivered >= 0 && entry.DeliveryFailed >= 0 && entry.Sessions >= 0);
+        }
+
+        // The cap gauge: an `sk_` caller sees every live key on the account.
+        Assert.True(byOperation.Keys.Count >= 2, "expected the seeded account's two keys");
+        foreach (var key in byOperation.Keys)
+        {
+            Assert.False(string.IsNullOrEmpty(key.Id));
+            Assert.False(string.IsNullOrEmpty(key.Name));
+            Assert.Contains(key.Kind, new[] { "secret", "publishable" });
+            Assert.True(key.UsedToday >= 0);
+            Assert.Equal(key.DailyCreditLimit.HasValue, key.IsCapped);
+        }
+
+        var byDay = await _fx.Api.GetUsageAsync(new UsageQuery { GroupBy = UsageGroupBy.Day });
+        Assert.Equal(UsageGroupBy.Day, byDay.GroupBy);
+        Assert.Contains(
+            DateTime.UtcNow.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+            byDay.Series.Select(entry => entry.Key));
+
+        var unauthorized = await _fx.Anonymous.SendAsync("GET", "/usage");
+        Assert.Equal(401, unauthorized.Status);
+        Assert.Equal("unauthorized", unauthorized.ErrorCode);
+
+        var backwards = await Assert.ThrowsAsync<SnapneditException>(() => _fx.Api.GetUsageAsync(new UsageQuery
+        {
+            From = new DateTimeOffset(2026, 9, 13, 0, 0, 0, TimeSpan.Zero),
+            To = new DateTimeOffset(2026, 9, 1, 0, 0, 0, TimeSpan.Zero),
+        }));
+        Assert.Equal(400, backwards.Status);
+        Assert.Equal(ErrorCode.InvalidInput, backwards.Code);
+    }
+
     [Fact(DisplayName = "errors.envelope")]
     public async Task ErrorsEnvelope()
     {
@@ -779,7 +888,7 @@ public sealed class ConformanceTests : IClassFixture<ConformanceServerFixture>
             .ToArray();
 
         Assert.Equal(declared, implemented);
-        Assert.Equal(24, declared.Length);
+        Assert.Equal(25, declared.Length);
         Assert.Equal(1, _fx.Scenarios.GetProperty("version").GetInt32());
     }
 

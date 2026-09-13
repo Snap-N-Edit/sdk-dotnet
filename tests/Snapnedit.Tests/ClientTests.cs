@@ -62,7 +62,8 @@ public sealed class ClientTests
     {
         var handler = new FakeHttpMessageHandler(FakeHttpMessageHandler.Json(
             HttpStatusCode.Accepted,
-            "{\"jobId\":\"job-1\",\"status\":{\"state\":\"queued\"},\"input\":{\"kind\":\"asset\"},\"destination\":null,\"delivery\":null}"));
+            "{\"jobId\":\"job-1\",\"status\":{\"state\":\"queued\"},\"input\":{\"kind\":\"asset\"},\"destination\":null,\"delivery\":null," +
+            "\"creditCost\":2,\"cached\":false,\"deliveryOnly\":false}"));
         using var client = Build(handler);
 
         var created = await client.CreateJobAsync(
@@ -75,6 +76,10 @@ public sealed class ClientTests
         Assert.Equal(202, created.HttpStatus);
         Assert.False(created.WasCacheHit);
         Assert.Equal(JobInputKind.Asset, created.InputKind);
+        // The usage attribution the api now echoes on every job response.
+        Assert.Equal(2, created.CreditCost);
+        Assert.False(created.Cached);
+        Assert.False(created.DeliveryOnly);
         Assert.Equal(
             "{\"operation\":\"upscale\",\"inputAssetId\":\"asset-9\",\"params\":{\"factor\":\"4\"}}",
             handler.Requests[0].Body);
@@ -535,5 +540,235 @@ public sealed class ClientTests
             new CreateJobOptions { Params = new Dictionary<string, object?> { ["oops"] = new object() } }).GetAwaiter().GetResult());
 
         Assert.Contains("params.oops", error.Message, StringComparison.Ordinal);
+    }
+
+    private const string UsageReportBody = "{\"range\":{\"from\":\"2026-08-14T00:00:00.000Z\",\"to\":\"2026-09-13T23:59:59.999Z\"},\"groupBy\":\"operation\",\"totals\":{\"jobs\":12,\"credits\":17,\"cacheHits\":3,\"free\":2,\"failed\":1,\"delivered\":4,\"deliveryFailed\":1,\"sessions\":5,\"activeSessions\":2},\"series\":[{\"key\":\"upscale\",\"label\":\"upscale\",\"jobs\":8,\"credits\":16,\"cacheHits\":2,\"free\":0,\"failed\":1,\"delivered\":4,\"deliveryFailed\":1,\"sessions\":0},{\"key\":\"resize-image\",\"label\":\"resize-image\",\"jobs\":4,\"credits\":0,\"cacheHits\":1,\"free\":2,\"failed\":0,\"delivered\":0,\"deliveryFailed\":0,\"sessions\":0}],\"keys\":[{\"id\":\"key-1\",\"name\":\"server\",\"kind\":\"secret\",\"dailyCreditLimit\":null,\"usedToday\":9},{\"id\":\"key-2\",\"name\":\"web\",\"kind\":\"publishable\",\"dailyCreditLimit\":50,\"usedToday\":12}]}";
+
+    [Fact]
+    public async Task GetUsageAsync_with_no_query_sends_no_query_string()
+    {
+        var handler = new FakeHttpMessageHandler(FakeHttpMessageHandler.Json(HttpStatusCode.OK, UsageReportBody));
+        using var client = Build(handler);
+
+        await client.GetUsageAsync();
+
+        Assert.Equal("https://api.example.test/usage", handler.Urls[0]);
+        Assert.Equal("Bearer sk_live_test", handler.Requests[0].Authorization);
+    }
+
+    [Fact]
+    public async Task GetUsageAsync_sends_only_the_filters_that_were_set()
+    {
+        var handler = new FakeHttpMessageHandler(FakeHttpMessageHandler.Json(HttpStatusCode.OK, UsageReportBody));
+        using var client = Build(handler);
+
+        await client.GetUsageAsync(new UsageQuery
+        {
+            From = new DateTimeOffset(2026, 9, 1, 14, 30, 45, TimeSpan.FromHours(2)),
+            To = new DateTimeOffset(2026, 9, 13, 0, 0, 0, TimeSpan.Zero),
+            GroupBy = UsageGroupBy.Key,
+            KeyId = "key-2",
+            Origin = "https://app.example.com",
+            Source = UsageSource.Embed,
+        });
+
+        // The offset is normalized to UTC, and every value is percent-encoded.
+        Assert.Equal(
+            "https://api.example.test/usage?from=2026-09-01T12%3A30%3A45.000Z&to=2026-09-13T00%3A00%3A00.000Z" +
+            "&groupBy=key&keyId=key-2&origin=https%3A%2F%2Fapp.example.com&source=embed",
+            handler.Urls[0]);
+    }
+
+    [Fact]
+    public async Task GetUsageAsync_parses_the_range_totals_series_and_key_gauge()
+    {
+        var handler = new FakeHttpMessageHandler(FakeHttpMessageHandler.Json(HttpStatusCode.OK, UsageReportBody));
+        using var client = Build(handler);
+
+        var report = await client.GetUsageAsync(new UsageQuery { GroupBy = UsageGroupBy.Operation });
+
+        Assert.Equal("2026-08-14T00:00:00.000Z", report.Range.From);
+        Assert.Equal("2026-09-13T23:59:59.999Z", report.Range.To);
+        Assert.Equal(UsageGroupBy.Operation, report.GroupBy);
+        Assert.Equal(12, report.Totals.Jobs);
+        Assert.Equal(17, report.Totals.Credits);
+        Assert.Equal(3, report.Totals.CacheHits);
+        Assert.Equal(5, report.Totals.Sessions);
+        Assert.Equal(2, report.Totals.ActiveSessions);
+
+        Assert.Equal(new[] { "upscale", "resize-image" }, report.Series.Select(entry => entry.Key).ToArray());
+        Assert.Equal(16, report.Bucket("upscale")!.Credits);
+        Assert.Equal(0, report.Bucket("resize-image")!.Credits);
+        Assert.Null(report.Bucket("magic-eraser"));
+
+        var uncapped = report.Keys[0];
+        Assert.Equal("key-1", uncapped.Id);
+        Assert.Equal("secret", uncapped.Kind);
+        Assert.Null(uncapped.DailyCreditLimit);
+        Assert.False(uncapped.IsCapped);
+        Assert.Null(uncapped.RemainingToday);
+
+        var capped = report.Keys[1];
+        Assert.True(capped.IsCapped);
+        Assert.Equal(38, capped.RemainingToday);
+    }
+
+    [Fact]
+    public async Task GetUsageAsync_never_reports_a_negative_remaining_allowance()
+    {
+        var handler = new FakeHttpMessageHandler(FakeHttpMessageHandler.Json(
+            HttpStatusCode.OK,
+            "{\"range\":{\"from\":\"2026-09-01T00:00:00.000Z\",\"to\":\"2026-09-13T00:00:00.000Z\"}," +
+            "\"groupBy\":\"day\",\"totals\":{},\"series\":[]," +
+            "\"keys\":[{\"id\":\"k\",\"name\":\"web\",\"kind\":\"publishable\"," +
+            "\"dailyCreditLimit\":10,\"usedToday\":14}]}"));
+        using var client = Build(handler);
+
+        var report = await client.GetUsageAsync();
+
+        Assert.Equal(0, report.Keys[0].RemainingToday);
+        // Absent counters read as 0: "absent" and "none" are the same for a count.
+        Assert.Equal(0, report.Totals.Jobs);
+        Assert.Equal(0, report.Totals.ActiveSessions);
+    }
+
+    [Fact]
+    public async Task GetUsageAsync_reads_an_embed_tokens_report_which_carries_no_keys()
+    {
+        var handler = new FakeHttpMessageHandler(FakeHttpMessageHandler.Json(
+            HttpStatusCode.OK,
+            "{\"range\":{\"from\":\"2026-09-01T00:00:00.000Z\",\"to\":\"2026-09-13T00:00:00.000Z\"}," +
+            "\"groupBy\":\"origin\",\"totals\":{\"jobs\":2,\"credits\":4}," +
+            "\"series\":[{\"key\":\"https://app.example\",\"label\":\"https://app.example\"," +
+            "\"jobs\":2,\"credits\":4}]}"));
+        using var client = Build(handler);
+
+        var report = await client.GetUsageAsync(new UsageQuery { GroupBy = UsageGroupBy.Origin });
+
+        Assert.Empty(report.Keys);
+        Assert.Equal(UsageGroupBy.Origin, report.GroupBy);
+        Assert.Equal(4, report.Bucket("https://app.example")!.Credits);
+    }
+
+    [Fact]
+    public async Task GetUsageAsync_surfaces_a_backwards_range_as_invalid_input()
+    {
+        var handler = new FakeHttpMessageHandler(FakeHttpMessageHandler.Json(
+            HttpStatusCode.BadRequest,
+            "{\"error\":{\"code\":\"invalid_input\",\"message\":\"from must not be after to\"}}"));
+        using var client = Build(handler);
+
+        var error = await Assert.ThrowsAsync<SnapneditException>(() => client.GetUsageAsync(new UsageQuery
+        {
+            From = new DateTimeOffset(2026, 9, 13, 0, 0, 0, TimeSpan.Zero),
+            To = new DateTimeOffset(2026, 9, 1, 0, 0, 0, TimeSpan.Zero),
+        }));
+
+        Assert.Equal(ErrorCode.InvalidInput, error.Code);
+        Assert.Equal(400, error.Status);
+    }
+
+    [Fact]
+    public async Task GetUsageAsync_refuses_a_grouping_it_does_not_know()
+    {
+        var handler = new FakeHttpMessageHandler(FakeHttpMessageHandler.Json(
+            HttpStatusCode.OK,
+            "{\"range\":{\"from\":\"a\",\"to\":\"b\"},\"groupBy\":\"galaxy\",\"totals\":{},\"series\":[]}"));
+        using var client = Build(handler);
+
+        var error = await Assert.ThrowsAsync<SnapneditException>(() => client.GetUsageAsync());
+
+        Assert.Equal(ErrorCode.Internal, error.Code);
+        Assert.Contains("galaxy", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task CreateJobAsync_reports_a_cache_hit_as_cached_and_free()
+    {
+        var handler = new FakeHttpMessageHandler(FakeHttpMessageHandler.Json(
+            HttpStatusCode.OK,
+            "{\"jobId\":\"job-2\",\"status\":{\"state\":\"succeeded\",\"outputAssetId\":\"out-1\"," +
+            "\"download\":{\"url\":\"/_local/results/a.png?sig=x\",\"expiresAt\":\"2026-01-01T00:00:00.000Z\"}}," +
+            "\"input\":{\"kind\":\"asset\"},\"destination\":null,\"delivery\":null," +
+            "\"creditCost\":0,\"cached\":true,\"deliveryOnly\":false}"));
+        using var client = Build(handler);
+
+        var created = await client.CreateJobAsync(Operations.Upscale, JobInput.FromAssetId("asset-9"));
+
+        Assert.True(created.Cached);
+        Assert.True(created.WasCacheHit);
+        Assert.Equal(0, created.CreditCost);
+        Assert.False(created.DeliveryOnly);
+        // The attribution survives the conversion to the flattened view.
+        var view = created.ToJobView();
+        Assert.True(view.Cached);
+        Assert.Equal(0, view.CreditCost);
+    }
+
+    [Fact]
+    public async Task GetJobAsync_reads_a_delivery_only_clone()
+    {
+        var handler = new FakeHttpMessageHandler(FakeHttpMessageHandler.Json(
+            HttpStatusCode.OK,
+            "{\"state\":\"succeeded\",\"outputAssetId\":\"out-1\",\"download\":null," +
+            "\"input\":{\"kind\":\"asset\"},\"destination\":{\"type\":\"saved\",\"id\":\"dest-1\"}," +
+            "\"delivery\":{\"status\":\"pending\",\"attempts\":0}," +
+            "\"creditCost\":0,\"cached\":true,\"deliveryOnly\":true}"));
+        using var client = Build(handler);
+
+        var view = await client.GetJobAsync("job-3");
+
+        Assert.True(view.DeliveryOnly);
+        Assert.True(view.Cached);
+        Assert.Equal(0, view.CreditCost);
+        // Cached, but not settled: the bucket write is still the worker's job.
+        Assert.False(view.IsSettled);
+    }
+
+    [Fact]
+    public async Task A_job_body_without_the_usage_fields_reads_as_unbilled_and_uncached()
+    {
+        var handler = new FakeHttpMessageHandler(FakeHttpMessageHandler.Json(
+            HttpStatusCode.Accepted,
+            "{\"jobId\":\"job-4\",\"status\":{\"state\":\"queued\"},\"input\":{\"kind\":\"asset\"}," +
+            "\"destination\":null,\"delivery\":null}"));
+        using var client = Build(handler);
+
+        var created = await client.CreateJobAsync(Operations.Upscale, JobInput.FromAssetId("asset-9"));
+
+        Assert.Equal(0, created.CreditCost);
+        Assert.False(created.Cached);
+        Assert.False(created.DeliveryOnly);
+        Assert.False(created.WasCacheHit);
+    }
+
+    [Fact]
+    public async Task RunAsync_carries_the_jobs_attribution_onto_the_result()
+    {
+        var handler = new FakeHttpMessageHandler(
+            FakeHttpMessageHandler.Json(HttpStatusCode.OK, UploadCreated),
+            FakeHttpMessageHandler.Empty(HttpStatusCode.NoContent),
+            FakeHttpMessageHandler.Json(HttpStatusCode.OK, UploadConfirmed),
+            FakeHttpMessageHandler.Json(
+                HttpStatusCode.Accepted,
+                "{\"jobId\":\"job-5\",\"status\":{\"state\":\"queued\"},\"input\":{\"kind\":\"asset\"}," +
+                "\"destination\":null,\"delivery\":null,\"creditCost\":2,\"cached\":false,\"deliveryOnly\":false}"),
+            FakeHttpMessageHandler.Json(
+                HttpStatusCode.OK,
+                "{\"state\":\"succeeded\",\"outputAssetId\":\"out-5\"," +
+                "\"download\":{\"url\":\"/_local/results/b.png?sig=x\",\"expiresAt\":\"2026-01-01T00:00:00.000Z\"}," +
+                "\"input\":{\"kind\":\"asset\"},\"destination\":null,\"delivery\":null," +
+                "\"creditCost\":2,\"cached\":false,\"deliveryOnly\":false}"),
+            FakeHttpMessageHandler.Binary(HttpStatusCode.OK, new byte[] { 9, 9 }, "image/png"));
+        using var client = Build(handler);
+
+        var result = await client.RunAsync(
+            Operations.Upscale,
+            JobInput.FromBytes(new byte[] { 1, 2, 3, 4, 5, 6, 7, 8 }, "image/png"),
+            new RunOptions { PollInterval = TimeSpan.FromMilliseconds(1) });
+
+        Assert.Equal(2, result.CreditCost);
+        Assert.False(result.Cached);
+        Assert.False(result.DeliveryOnly);
     }
 }

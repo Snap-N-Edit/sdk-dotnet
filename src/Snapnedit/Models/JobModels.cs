@@ -191,18 +191,30 @@ public sealed record JobDelivery
     public bool? LocalCopyDeleted { get; }
 }
 
-/// <summary>The bring-your-own-storage envelope every job response carries.</summary>
+/// <summary>The envelope every job response carries: where the bytes came from, where they go, and what the job cost.</summary>
 public record JobEnvelope
 {
     /// <summary>Creates an envelope.</summary>
     /// <param name="inputKind">Whether the input was an asset or a url.</param>
     /// <param name="destination">The destination summary, or <see langword="null"/>.</param>
     /// <param name="delivery">The delivery record, or <see langword="null"/>.</param>
-    public JobEnvelope(JobInputKind inputKind, JobDestinationSummary? destination, JobDelivery? delivery)
+    /// <param name="creditCost">Credits actually debited for this job.</param>
+    /// <param name="cached">Whether the result came out of the result cache.</param>
+    /// <param name="deliveryOnly">Whether this row only delivers an already-cached result.</param>
+    public JobEnvelope(
+        JobInputKind inputKind,
+        JobDestinationSummary? destination,
+        JobDelivery? delivery,
+        int creditCost = 0,
+        bool cached = false,
+        bool deliveryOnly = false)
     {
         InputKind = inputKind;
         Destination = destination;
         Delivery = delivery;
+        CreditCost = creditCost;
+        Cached = cached;
+        DeliveryOnly = deliveryOnly;
     }
 
     /// <summary>Whether the job read its input from an uploaded asset or from a url.</summary>
@@ -213,6 +225,29 @@ public record JobEnvelope
 
     /// <summary>How delivery went, if there is a destination.</summary>
     public JobDelivery? Delivery { get; }
+
+    /// <summary>
+    /// Credits actually debited for THIS job: 0 for a free operation, a cache
+    /// hit, a delivery-only clone or an unmetered website session. Debited at
+    /// creation time and refunded in full if the job ends
+    /// <see cref="JobState.Failed"/>.
+    /// </summary>
+    public int CreditCost { get; }
+
+    /// <summary>
+    /// Whether the result came out of the result cache: no model ran and
+    /// nothing was billed. A cache hit is still a job — one row per REQUEST —
+    /// so it carries a NEW job id pointing at the SAME output asset as the job
+    /// whose result it reuses.
+    /// </summary>
+    public bool Cached { get; }
+
+    /// <summary>
+    /// Whether this row exists only to deliver an already-cached result to a
+    /// destination: cached and free, but still worth polling, because writing
+    /// to your bucket is work the worker has yet to do.
+    /// </summary>
+    public bool DeliveryOnly { get; }
 }
 
 /// <summary>What <c>GET /jobs/{id}</c> returns: the status, flattened, plus the envelope.</summary>
@@ -224,13 +259,19 @@ public sealed record JobView : JobEnvelope
     /// <param name="inputKind">Whether the input was an asset or a url.</param>
     /// <param name="destination">The destination summary, or <see langword="null"/>.</param>
     /// <param name="delivery">The delivery record, or <see langword="null"/>.</param>
+    /// <param name="creditCost">Credits actually debited for this job.</param>
+    /// <param name="cached">Whether the result came out of the result cache.</param>
+    /// <param name="deliveryOnly">Whether this row only delivers an already-cached result.</param>
     public JobView(
         string jobId,
         JobStatus status,
         JobInputKind inputKind,
         JobDestinationSummary? destination,
-        JobDelivery? delivery)
-        : base(inputKind, destination, delivery)
+        JobDelivery? delivery,
+        int creditCost = 0,
+        bool cached = false,
+        bool deliveryOnly = false)
+        : base(inputKind, destination, delivery, creditCost, cached, deliveryOnly)
     {
         JobId = jobId;
         Status = status;
@@ -266,14 +307,20 @@ public sealed record CreateJobResult : JobEnvelope
     /// <param name="inputKind">Whether the input was an asset or a url.</param>
     /// <param name="destination">The destination summary, or <see langword="null"/>.</param>
     /// <param name="delivery">The delivery record, or <see langword="null"/>.</param>
+    /// <param name="creditCost">Credits actually debited for this job.</param>
+    /// <param name="cached">Whether the result came out of the result cache.</param>
+    /// <param name="deliveryOnly">Whether this row only delivers an already-cached result.</param>
     public CreateJobResult(
         string jobId,
         JobStatus status,
         int httpStatus,
         JobInputKind inputKind,
         JobDestinationSummary? destination,
-        JobDelivery? delivery)
-        : base(inputKind, destination, delivery)
+        JobDelivery? delivery,
+        int creditCost = 0,
+        bool cached = false,
+        bool deliveryOnly = false)
+        : base(inputKind, destination, delivery, creditCost, cached, deliveryOnly)
     {
         JobId = jobId;
         Status = status;
@@ -289,12 +336,18 @@ public sealed record CreateJobResult : JobEnvelope
     /// <summary>The HTTP status: <c>202</c> for a newly queued job, <c>200</c> when the result cache already had it.</summary>
     public int HttpStatus { get; }
 
-    /// <summary>True when this was answered from the result cache — already succeeded, and never billed.</summary>
-    public bool WasCacheHit => HttpStatus == 200 && Status.State == JobState.Succeeded;
+    /// <summary>
+    /// True when this was answered from the result cache — already succeeded,
+    /// and never billed. Reads the api's own <see cref="JobEnvelope.Cached"/>
+    /// flag, falling back to the <c>200</c> (rather than <c>202</c>) such a
+    /// response is sent with.
+    /// </summary>
+    public bool WasCacheHit => Cached || (HttpStatus == 200 && Status.State == JobState.Succeeded);
 
     /// <summary>A <see cref="JobView"/> over the same data, for code that wants one shape.</summary>
     /// <returns>The equivalent job view.</returns>
-    public JobView ToJobView() => new JobView(JobId, Status, InputKind, Destination, Delivery);
+    public JobView ToJobView() =>
+        new JobView(JobId, Status, InputKind, Destination, Delivery, CreditCost, Cached, DeliveryOnly);
 }
 
 /// <summary>What <see cref="SnapneditClient.RunAsync"/> resolves to.</summary>
@@ -310,6 +363,9 @@ public sealed record RunResult : JobEnvelope
     /// <param name="inputKind">Whether the input was an asset or a url.</param>
     /// <param name="destination">The destination summary, or <see langword="null"/>.</param>
     /// <param name="delivery">The delivery record, or <see langword="null"/>.</param>
+    /// <param name="creditCost">Credits actually debited for the job.</param>
+    /// <param name="cached">Whether the result came out of the result cache.</param>
+    /// <param name="deliveryOnly">Whether the job only delivered an already-cached result.</param>
     public RunResult(
         string jobId,
         bool downloaded,
@@ -319,8 +375,11 @@ public sealed record RunResult : JobEnvelope
         SignedUrl? download,
         JobInputKind inputKind,
         JobDestinationSummary? destination,
-        JobDelivery? delivery)
-        : base(inputKind, destination, delivery)
+        JobDelivery? delivery,
+        int creditCost = 0,
+        bool cached = false,
+        bool deliveryOnly = false)
+        : base(inputKind, destination, delivery, creditCost, cached, deliveryOnly)
     {
         JobId = jobId;
         Downloaded = downloaded;
