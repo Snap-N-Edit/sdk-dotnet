@@ -1,0 +1,365 @@
+# Snapnedit — the official .NET SDK
+
+A small, dependency-free client for the [snapnedit](https://snapnedit.com) AI
+photo-editing API: upload an image, run an operation, get the result — or hand
+the API a URL and a destination bucket and never touch the bytes at all.
+
+- Targets **`netstandard2.0`** and **`net8.0`** — .NET Framework 4.6.1+, .NET
+  Core, .NET 5–10, Xamarin, Unity, MAUI.
+- **No dependencies** beyond the BCL (`System.Text.Json` on `netstandard2.0`).
+- **No reflection**: every request is written with `Utf8JsonWriter` and every
+  response is read field-by-field off `JsonElement`, so the package is
+  trim- and AOT-safe.
+- Async-only, with a `CancellationToken` on every call.
+- Bring your own `HttpClient`.
+
+```sh
+dotnet add package Snapnedit
+```
+
+> **NuGet publication is pending.** The package is not on nuget.org yet; until
+> it is, reference the project directly (`dotnet add reference
+> path/to/src/Snapnedit/Snapnedit.csproj`) or build a local package with
+> `dotnet pack -c Release` and add the output directory as a source.
+
+---
+
+## Fifteen lines
+
+```csharp
+using Snapnedit;
+
+using var client = new SnapneditClient(Environment.GetEnvironmentVariable("SNAPNEDIT_API_KEY")!);
+
+// Upload, run, poll, download — one call.
+var cutout = await client.RunAsync(Operations.RemoveBackground, JobInput.FromFile("cat.jpg"));
+await File.WriteAllBytesAsync("cat-cutout.png", cutout.Output!);
+
+// Typed params, so a bad value is a compile error rather than a 400.
+var thumb = await client.RunAsync(
+    Operations.ResizeImage,
+    JobInput.FromFile("cat.jpg"),
+    new RunOptions { TypedParams = new ResizeImageParams { Width = 512, Fit = ResizeFit.Cover } });
+
+Console.WriteLine($"{thumb.Output!.Length} bytes of {thumb.Mime}");
+```
+
+`RunAsync` is the whole flow. When you want the steps yourself:
+
+```csharp
+var asset  = await client.UploadAsync(File.ReadAllBytes("cat.jpg"), "image/jpeg");
+var job    = await client.CreateJobAsync(Operations.Upscale, JobInput.FromAssetId(asset.AssetId),
+                 new CreateJobOptions { TypedParams = new UpscaleParams { Factor = UpscaleFactor.X4 } });
+var done   = await client.WaitForJobAsync(job.JobId);   // waits for delivery to settle too
+```
+
+Configuration lives on `SnapneditClientOptions`:
+
+```csharp
+using var client = new SnapneditClient(apiKey, new SnapneditClientOptions
+{
+    BaseUrl = "http://localhost:8787",          // default: https://snapnedit.com/api
+    HttpClient = httpClientFactory.CreateClient(), // never disposed by the SDK
+    MaxRetries = 2,                              // idempotent calls only — see below
+    RequestTimeout = TimeSpan.FromSeconds(100),
+});
+```
+
+**Retries.** Network failures, `429` and `5xx` are retried with exponential,
+jittered backoff (honouring `Retry-After`) on **GET, PUT and DELETE only**. A
+`POST` is never retried: it may already have created a job and debited credits
+before the response was lost.
+
+---
+
+## Bring your own storage
+
+The bytes never have to pass through your process. Give the API a URL to read
+from, a destination to write to, or both.
+
+```csharp
+// Input: a presigned GET in your own bucket. The SERVER fetches it — https
+// only, no redirects, no private addresses, 30s, size-capped. A fetch failure
+// is a terminal `input_fetch_failed` and the credits are refunded.
+var input = JobInput.FromUrl("https://my-bucket.s3.amazonaws.com/in.png?X-Amz-Signature=…");
+
+// Output: a presigned PUT you signed yourself.
+var result = await client.RunAsync(Operations.Upscale, input, new RunOptions
+{
+    Destination = JobDestination.PresignedPut(
+        "https://my-bucket.s3.amazonaws.com/out.png?X-Amz-Signature=…",
+        new Dictionary<string, string> { ["content-type"] = "image/png" }),
+});
+
+Console.WriteLine(result.Delivery!.Status);   // Delivered
+Console.WriteLine(result.Downloaded);         // false — the bytes are already yours
+```
+
+When a destination you named was delivered successfully, `RunAsync` skips the
+download by default — pulling the bytes back would defeat the point. A delivery
+that **failed** still downloads, so you are never left empty-handed
+(`status: succeeded` with `delivery.status: failed` is a real and correct
+combination; the result is still at `result.Download`). Override either way
+with `RunOptions.Download`.
+
+### Saved destinations
+
+Save an S3-compatible bucket once and name it by id — or make it your account
+default and stop naming it at all.
+
+```csharp
+var bucket = await client.Destinations.CreateAsync(new StorageDestinationInput(
+    name: "prod results",
+    provider: StorageProvider.CloudflareR2,
+    bucket: "results",
+    accessKeyId: "…",
+    secretAccessKey: "…")           // sealed at rest; no endpoint ever echoes it
+{
+    AccountId = "…",
+    KeyPrefix = "snapnedit/",
+    IsDefault = true,               // applied to every job that names no destination
+    DeleteAfterDelivery = false,    // true drops our copy once your bucket confirms
+});
+
+var probe = await client.Destinations.TestAsync(bucket.Id);   // a real probe write
+Console.WriteLine(probe.Ok ? $"ok in {probe.LatencyMs}ms" : probe.Error);
+
+// Name it on a job…
+await client.RunAsync(Operations.Upscale, input,
+    new RunOptions { Destination = JobDestination.Saved(bucket.Id) });
+
+// …or opt a single job OUT of the account default. `null` is not the same as
+// omitting the field: omitted means "apply my default", OptOut means "don't".
+await client.RunAsync(Operations.Upscale, input,
+    new RunOptions { Destination = JobDestination.OptOut });
+```
+
+`Destinations` also has `ListAsync`, `UpdateAsync`, `DeleteAsync` and
+`PresignUploadAsync` — the last mints a 15-minute signed PUT for one object in
+your bucket, so a browser can upload an export without ever holding your S3
+credentials.
+
+Delivered objects land at `<keyPrefix><yyyy>/<mm>/<dd>/<jobId>.<ext>`, reported
+on `result.Delivery.Bucket` / `.Key`. With `DeleteAfterDelivery` the only copy
+is yours, and `result.Download` is `null` — that is a documented outcome, not
+an error.
+
+---
+
+## Webhooks (ASP.NET Core)
+
+Register an endpoint URL on your account and it receives a signed POST every
+time a job finishes. Verify the **raw body**, before any JSON parse.
+
+```csharp
+var builder = WebApplication.CreateBuilder(args);
+var app = builder.Build();
+var secret = builder.Configuration["Snapnedit:WebhookSecret"]!;
+
+app.MapPost("/webhooks/snapnedit", async (HttpRequest request) =>
+{
+    request.EnableBuffering();
+    using var reader = new StreamReader(request.Body);
+    var payload = await reader.ReadToEndAsync();          // the bytes as received
+    var signature = request.Headers[SnapneditWebhooks.SignatureHeader].ToString();
+
+    WebhookEvent evt;
+    try
+    {
+        evt = SnapneditWebhooks.ConstructEvent(
+            payload,
+            signature,
+            secret,
+            new WebhookVerifyOptions { ToleranceSeconds = 300 });  // replay window
+    }
+    catch (SnapneditException)
+    {
+        return Results.BadRequest();                       // bad signature or stale
+    }
+
+    switch (evt.Type)
+    {
+        case WebhookEventType.JobSucceeded:
+            Console.WriteLine($"{evt.Data.JobId} → {evt.Data.OutputAssetId}");
+            break;
+        case WebhookEventType.JobFailed:
+            Console.WriteLine($"{evt.Data.JobId} failed: {evt.Data.ErrorCode}");
+            break;
+        default:
+            break;                                          // forward-compatible no-op
+    }
+
+    return Results.Ok();
+});
+
+app.Run();
+```
+
+`SnapneditWebhooks.Verify(payload, signature, secret)` returns a plain `bool` if
+you would rather branch than catch. It never throws for untrusted input:
+a malformed header, a bad MAC and a stale timestamp are all `false`.
+
+The header is `X-Snapnedit-Signature: t=<unix seconds>,v1=<hex>`; the signed
+string is `{t}.{rawBody}`, MAC'd with HMAC-SHA256 under your endpoint secret and
+compared in constant time. `v1` may appear more than once during a secret
+rotation — any match accepts the delivery.
+
+---
+
+## Embedding the editor
+
+```csharp
+// On your server, with your sk_ key. Hand the TOKEN to the browser, never the key.
+var token = await client.Embed.CreateTokenAsync(new EmbedTokenOptions
+{
+    TtlSeconds = 3600,
+    EndUserId = user.Id,
+    MaxCredits = 20,
+    AllowedOperations = new[] { Operations.RemoveBackground, Operations.Upscale },
+});
+```
+
+`Embed.CreateSessionAsync(publishableKey, hostOrigin)` is the other door: the
+frame's own exchange of a `pk_` key for the same short-lived token.
+
+---
+
+## Errors
+
+Every failure is a `SnapneditException` carrying a **machine-readable**
+`ErrorCode` and the HTTP `Status`. Branch on the code; the message is human text
+and changes.
+
+```csharp
+try
+{
+    await client.RunAsync(Operations.Upscale, JobInput.FromFile("cat.jpg"));
+}
+catch (SnapneditException e) when (e.Code == ErrorCode.PaymentRequired)
+{
+    // out of credits (402)
+}
+catch (SnapneditTimeoutException)
+{
+    // polling ran out of time — the job may still be running
+}
+catch (SnapneditException e)
+{
+    logger.LogError("snapnedit {Code} ({Status}): {Message}", e.Code, e.Status, e.Message);
+}
+```
+
+| `ErrorCode` | Wire | Typically |
+| --- | --- | --- |
+| `InvalidInput` | `invalid_input` | 400 — bad params, an unknown param key, a missing `maskAssetId` |
+| `UnsupportedMime` | `unsupported_mime` | 400 — not `image/png`, `image/jpeg` or `image/webp` |
+| `TooLarge` | `too_large` | 400/413 — over the upload ceiling |
+| `NotFound` | `not_found` | 404 — no such job/asset/destination, **and** anything belonging to another account |
+| `InputFetchFailed` | `input_fetch_failed` | terminal job failure fetching `inputUrl`; refunded |
+| `ProviderFailed` | `provider_failed` | a model provider failed; retryable |
+| `ProviderExhausted` | `provider_exhausted` | every provider for the operation failed |
+| `RateLimited` | `rate_limited` | 429 |
+| `BotCheckFailed` | `bot_check_failed` | a bot-protection challenge was not satisfied |
+| `Unauthorized` | `unauthorized` | 401 — missing or unknown credential |
+| `Forbidden` | `forbidden` | 403 — e.g. an anonymous caller using `inputUrl` |
+| `PaymentRequired` | `payment_required` | 402 — out of credits |
+| `Internal` | `internal` | 5xx, and the fallback for any code this package does not know |
+
+A job that fails surfaces the job's own `errorCode` as `e.Code` with
+`Status == 200` — the HTTP call succeeded, the work did not.
+
+---
+
+## Operations
+
+`Operations` has a constant for each id, and a typed params record for each
+operation. A cost of 0 is free; a **cache hit is never billed** and a terminal
+failure is **refunded**.
+
+| Operation | Constant | Credits | Mask | Params record |
+| --- | --- | --- | --- | --- |
+| `remove-background` | `Operations.RemoveBackground` | 1 | | `RemoveBackgroundParams` |
+| `upscale` | `Operations.Upscale` | 2 | | `UpscaleParams` (`Factor`) |
+| `unblur` | `Operations.Unblur` | 1 | | `UnblurParams` |
+| `colorize` | `Operations.Colorize` | 1 | | `ColorizeParams` |
+| `style-transfer` | `Operations.StyleTransfer` | 2 | | `StyleTransferParams` (`Style`) |
+| `retouch` | `Operations.Retouch` | 1 | | `RetouchParams` |
+| `beautify` | `Operations.Beautify` | 1 | | `BeautifyParams` (`Amount`) |
+| `magic-eraser` | `Operations.MagicEraser` | 2 | ✅ | `MagicEraserParams` |
+| `generative-fill` | `Operations.GenerativeFill` | 3 | ✅ | `GenerativeFillParams` (`Prompt`, `Mode`) |
+| `remove-watermark` | `Operations.RemoveWatermark` | 2 | ✅ | `RemoveWatermarkParams` |
+| `ai-denoise` | `Operations.AiDenoise` | 1 | | `AiDenoiseParams` (`Strength`) |
+| `replace-sky` | `Operations.ReplaceSky` | 2 | | `ReplaceSkyParams` (`Sky`) |
+| `relight` | `Operations.Relight` | 2 | | `RelightParams` (`Direction`) |
+| `replace-background` | `Operations.ReplaceBackground` | 2 | | `ReplaceBackgroundParams` (`Background`) |
+| `strip-metadata` | `Operations.StripMetadata` | 1 | | `StripMetadataParams` |
+| `auto-remove-watermark` | `Operations.AutoRemoveWatermark` | 2 | | `AutoRemoveWatermarkParams` (`Strength`) |
+| `resize-image` | `Operations.ResizeImage` | **0** | | `ResizeImageParams` (`Width`, `Height`, `Fit`, `Format`, `Quality`) |
+
+Mask-guided operations refuse the job without a mask. Pass the bytes and let the
+client do the upload:
+
+```csharp
+await client.RunAsync(Operations.MagicEraser, JobInput.FromFile("photo.png"), new RunOptions
+{
+    Mask = JobInput.FromFile("mask.png"),   // uploaded, and params.maskAssetId set for you
+});
+```
+
+Deployments may **defer** an operation whose model has not shipped yet
+(`generative-fill`, `relight`, `auto-remove-watermark` at the time of writing).
+`ListOperationsAsync()` is the live catalog — accepted mime types, maximum input
+dimension, params JSON Schema and `RequiresMask` — and the thing to trust at
+runtime.
+
+---
+
+## Public API at a glance
+
+| | |
+| --- | --- |
+| `new SnapneditClient(apiKey, options?)` | The client. Thread-safe, long-lived, `IDisposable`. |
+| `RunAsync(operation, input, options?, ct)` | Upload → create → poll → download. |
+| `CreateJobAsync` / `GetJobAsync` / `WaitForJobAsync` | The steps, separately. |
+| `UploadAsync(bytes\|JobInput, mime?, ct)` | `POST /uploads` → PUT → confirm. |
+| `ListOperationsAsync(ct)` | The live operation catalog. |
+| `Destinations.{List,Create,Update,Delete,Test,PresignUpload}Async` | Saved storage destinations. |
+| `Embed.{CreateSession,CreateToken}Async` | Embedded-editor tokens. |
+| `Designs.{Create,CreatePages,Render}Async` | Server-side design composition and rendering. |
+| `SnapneditWebhooks.{Verify,ConstructEvent,Parse,ComputeSignature}` | Webhook signatures. |
+| `JobInput.{FromBytes,FromStream,FromFile,FromUrl,FromAssetId}` | Where an image comes from. |
+| `JobDestination.{PresignedPut,Saved,OptOut}` | Where the result goes. |
+
+---
+
+## Building and testing
+
+```sh
+dotnet build -warnaserror
+dotnet test                                # unit + conformance
+dotnet test --filter Category!=Conformance # unit only
+dotnet pack -c Release
+```
+
+The **conformance suite** is one test per scenario in the monorepo's
+`test/conformance/scenarios.json` — the language-neutral contract every
+snapnedit SDK is held to. Each test is named with its scenario id, so a changed
+scenario is a `grep` away from its test. The fixture boots
+`node scripts/conformance-server.mjs` from the repo root (the real Fastify API
+and the real worker, in one process, on an ephemeral port) and terminates it
+with `SIGTERM` on teardown. It needs `npm ci && npm run build` in the monorepo
+first, and is skipped by filtering on `Category!=Conformance` in a standalone
+checkout.
+
+---
+
+## About this repository
+
+Mirrored from the [snapnedit monorepo](https://github.com/Snap-N-Edit), where it
+is developed alongside the API it speaks to. Issues and pull requests are
+welcome here; the canonical source lives in the monorepo and lands here by
+subtree split, history intact.
+
+Full API reference: **<https://snapnedit.com/docs/api-reference>**.
+
+MIT licensed — see [LICENSE](./LICENSE).

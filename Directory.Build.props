@@ -1,0 +1,39 @@
+<Project>
+
+  <!--
+    Shared build + package metadata for every project in this repository.
+    `sdks/dotnet` is a standalone .NET solution: it is developed inside the
+    snapnedit monorepo and mirrored to github.com/Snap-N-Edit/sdk-dotnet, so
+    nothing here may depend on the surrounding npm workspaces.
+  -->
+
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <NoWarn>$(NoWarn);NU1902;NU1903</NoWarn>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <DebugType>portable</DebugType>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <DeterministicSourcePaths>false</DeterministicSourcePaths>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <Version>0.1.0</Version>
+    <Authors>snapnedit</Authors>
+    <Company>snapnedit</Company>
+    <Product>snapnedit .NET SDK</Product>
+    <Copyright>Copyright (c) 2026 snapnedit</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://snapnedit.com/docs/api-reference</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/Snap-N-Edit/sdk-dotnet</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>snapnedit;image;ai;photo-editing;remove-background;upscale;sdk</PackageTags>
+    <PackageReleaseNotes>See CHANGELOG.md.</PackageReleaseNotes>
+  </PropertyGroup>
+
+</Project>

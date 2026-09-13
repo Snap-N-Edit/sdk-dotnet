@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>netstandard2.0;net8.0</TargetFrameworks>
+    <AssemblyName>Snapnedit</AssemblyName>
+    <RootNamespace>Snapnedit</RootNamespace>
+    <PackageId>Snapnedit</PackageId>
+    <Title>Snapnedit</Title>
+    <Description>Official .NET client for the snapnedit AI photo-editing API: run image operations, upload assets, bring your own storage, manage saved destinations and verify webhook signatures.</Description>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <IsPackable>true</IsPackable>
+    <!--
+      No reflection-based (de)serialization anywhere in this assembly: every
+      request body is written with Utf8JsonWriter and every response is read
+      from JsonElement by hand, so the whole client is trim- and AOT-safe
+      without a JsonSerializerContext.
+    -->
+    <IsTrimmable>true</IsTrimmable>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(TargetFramework)' == 'net8.0'">
+    <IsAotCompatible>true</IsAotCompatible>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0'">
+    <!-- In-box from net8.0 onwards; only netstandard2.0 needs the package. -->
+    <PackageReference Include="System.Text.Json" Version="8.0.5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="\" />
+    <None Include="../../LICENSE" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+</Project>
