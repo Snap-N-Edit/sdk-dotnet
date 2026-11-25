@@ -759,7 +759,7 @@ public sealed class ConformanceTests : IClassFixture<ConformanceServerFixture>
 
         var operations = await _fx.Api.ListOperationsAsync();
         Assert.Equal(
-            new[] { "image/jpeg", "image/png", "image/webp" },
+            new[] { "image/avif", "image/heic", "image/heif", "image/jpeg", "image/png", "image/webp" },
             operations.SelectMany(o => o.Accept).Distinct().OrderBy(m => m, StringComparer.Ordinal).ToArray());
     }
 
