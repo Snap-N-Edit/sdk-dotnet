@@ -50,6 +50,7 @@ public sealed class SnapneditClient : IDisposable
         Destinations = new DestinationsClient(_transport);
         Embed = new EmbedClient(_transport);
         Designs = new DesignsClient(_transport);
+        WebhookEndpoints = new WebhookEndpointsClient(_transport);
     }
 
     /// <summary>The options this client was built with.</summary>
@@ -63,6 +64,9 @@ public sealed class SnapneditClient : IDisposable
 
     /// <summary>Server-side design rendering.</summary>
     public DesignsClient Designs { get; }
+
+    /// <summary>Your account's webhook endpoints.</summary>
+    public WebhookEndpointsClient WebhookEndpoints { get; }
 
     /// <summary>
     /// <c>GET /operations</c> — the operation catalog: accepted mime types,
@@ -348,7 +352,8 @@ public sealed class SnapneditClient : IDisposable
                         settled.Delivery,
                         settled.CreditCost,
                         settled.Cached,
-                        settled.DeliveryOnly);
+                        settled.DeliveryOnly,
+                        settled.Test);
                 }
 
                 var fetched = await _transport
@@ -366,7 +371,8 @@ public sealed class SnapneditClient : IDisposable
                     settled.Delivery,
                     settled.CreditCost,
                     settled.Cached,
-                    settled.DeliveryOnly);
+                    settled.DeliveryOnly,
+                    settled.Test);
             }
 
             case JobState.Failed:
@@ -420,6 +426,68 @@ public sealed class SnapneditClient : IDisposable
         return ApiParse.UsageReport(response.Root, url);
     }
 
+    /// <summary>
+    /// <c>GET /account</c> — who this secret key belongs to, the account's
+    /// credit balance, and whether the key is live or <c>sk_test_</c>.
+    /// </summary>
+    /// <param name="cancellationToken">Cancels the request.</param>
+    /// <returns>The account, its balance and the key's mode.</returns>
+    /// <exception cref="SnapneditException">
+    /// <see cref="ErrorCode.Unauthorized"/> for anything but a secret key — an
+    /// embed token included.
+    /// </exception>
+    public async Task<AccountInfo> GetAccountAsync(CancellationToken cancellationToken = default)
+    {
+        var url = _transport.ApiUrl("/account");
+        using var response = await _transport
+            .SendJsonAsync(HttpMethod.Get, url, null, true, cancellationToken)
+            .ConfigureAwait(false);
+        return ApiParse.Account(response.Root, url);
+    }
+
+    /// <summary><c>GET /jobs?limit=N</c> — the account's most recent jobs, newest first. Secret key only.</summary>
+    /// <param name="query">Limit (1–100, default 20), state and lane filters. <see langword="null"/> for the defaults.</param>
+    /// <param name="cancellationToken">Cancels the request.</param>
+    /// <returns>The jobs, each read exactly as <see cref="GetJobAsync"/> would, plus its creation time.</returns>
+    /// <exception cref="SnapneditException">
+    /// <see cref="ErrorCode.InvalidInput"/> for a limit outside 1–100;
+    /// <see cref="ErrorCode.Unauthorized"/> without a secret key.
+    /// </exception>
+    public async Task<IReadOnlyList<JobListItem>> ListJobsAsync(
+        JobListQuery? query = null,
+        CancellationToken cancellationToken = default)
+    {
+        // `limit` is always sent: without it GET /jobs is the older count endpoint.
+        var parts = new List<string> { "limit=" + (query?.Limit ?? 20).ToString(CultureInfo.InvariantCulture) };
+        if (query?.Status is { } status)
+        {
+            parts.Add("status=" + JobStateWire(status));
+        }
+
+        if (query?.Priority is { } priority)
+        {
+            parts.Add("priority=" + (priority == JobPriority.Background ? "background" : "interactive"));
+        }
+
+        var url = _transport.ApiUrl("/jobs?" + string.Join("&", parts));
+        using var response = await _transport
+            .SendJsonAsync(HttpMethod.Get, url, null, true, cancellationToken)
+            .ConfigureAwait(false);
+        var jobs = Json.Property(response.Root, "jobs");
+        if (jobs is null || jobs.Value.ValueKind != JsonValueKind.Array)
+        {
+            throw Json.Malformed(url, "missing array field \"jobs\"");
+        }
+
+        var items = new List<JobListItem>();
+        foreach (var entry in jobs.Value.EnumerateArray())
+        {
+            items.Add(ApiParse.JobListItem(entry, url));
+        }
+
+        return items;
+    }
+
     /// <summary>Releases the internally created <see cref="System.Net.Http.HttpClient"/>. An injected one is left alone.</summary>
     public void Dispose() => _transport.Dispose();
 
@@ -453,6 +521,16 @@ public sealed class SnapneditClient : IDisposable
             parts.Add(name + "=" + Uri.EscapeDataString(value!));
         }
     }
+
+    private static string JobStateWire(JobState state) => state switch
+    {
+        JobState.Queued => "queued",
+        JobState.Processing => "processing",
+        JobState.Succeeded => "succeeded",
+        JobState.Failed => "failed",
+        JobState.Canceled => "canceled",
+        _ => throw new ArgumentOutOfRangeException(nameof(state)),
+    };
 
     /// <summary>
     /// An instant in the exact shape the api parses: UTC, milliseconds, <c>Z</c>.

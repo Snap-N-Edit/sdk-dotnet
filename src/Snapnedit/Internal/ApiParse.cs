@@ -63,7 +63,8 @@ internal static class ApiParse
     /// feature sends none of these keys, and a plain upload-and-download caller
     /// must not start throwing against such a deployment. An absent
     /// <c>creditCost</c> reads as 0 and an absent flag as false — which is what
-    /// a deployment that does not report them means.
+    /// a deployment that does not report them means. The same goes for
+    /// <c>test</c>, which only <c>sk_test_</c> jobs carry as true.
     /// </summary>
     internal static JobEnvelope JobEnvelope(JsonElement obj)
     {
@@ -78,7 +79,8 @@ internal static class ApiParse
             delivery is null ? null : JobDelivery(delivery.Value),
             Json.OptionalInt(obj, "creditCost") ?? 0,
             Json.OptionalBool(obj, "cached") ?? false,
-            Json.OptionalBool(obj, "deliveryOnly") ?? false);
+            Json.OptionalBool(obj, "deliveryOnly") ?? false,
+            Json.OptionalBool(obj, "test") ?? false);
     }
 
     /// <summary>A destination summary, or <see langword="null"/> for anything unrecognized — never a throw.</summary>
@@ -138,7 +140,8 @@ internal static class ApiParse
             envelope.Delivery,
             envelope.CreditCost,
             envelope.Cached,
-            envelope.DeliveryOnly);
+            envelope.DeliveryOnly,
+            envelope.Test);
     }
 
     internal static CreateJobResult CreateJobResult(JsonElement obj, int httpStatus, string source)
@@ -159,7 +162,8 @@ internal static class ApiParse
             envelope.Delivery,
             envelope.CreditCost,
             envelope.Cached,
-            envelope.DeliveryOnly);
+            envelope.DeliveryOnly,
+            envelope.Test);
     }
 
     internal static OperationMetadata OperationMetadata(JsonElement obj, string source)
@@ -346,6 +350,63 @@ internal static class ApiParse
 
     /// <summary>A usage counter: absent and zero mean the same thing for a count.</summary>
     private static int Count(JsonElement obj, string name) => Json.OptionalInt(obj, name) ?? 0;
+
+    internal static AccountInfo Account(JsonElement obj, string source)
+    {
+        var key = Json.ObjectProperty(obj, "key");
+        if (key is null)
+        {
+            throw Json.Malformed(source, "missing object field \"key\"");
+        }
+
+        return new AccountInfo(
+            Json.RequireString(obj, "accountId", source),
+            Json.OptionalString(obj, "email"),
+            Json.RequireString(obj, "plan", source),
+            Count(obj, "credits"),
+            new AccountKey(
+                Json.RequireString(key.Value, "id", source),
+                Json.OptionalString(key.Value, "mode") == "test" ? ApiKeyMode.Test : ApiKeyMode.Live));
+    }
+
+    internal static JobListItem JobListItem(JsonElement obj, string source)
+    {
+        if (obj.ValueKind != JsonValueKind.Object)
+        {
+            throw Json.Malformed(source, "expected a job list item");
+        }
+
+        return new JobListItem(
+            JobView(Json.RequireString(obj, "jobId", source), obj, source),
+            Json.RequireString(obj, "createdAt", source));
+    }
+
+    internal static WebhookEndpoint WebhookEndpoint(JsonElement obj, string source)
+    {
+        var events = Json.Property(obj, "events");
+        if (obj.ValueKind != JsonValueKind.Object || events is null || events.Value.ValueKind != JsonValueKind.Array)
+        {
+            throw Json.Malformed(source, "expected a webhook endpoint object");
+        }
+
+        var names = new List<string>();
+        foreach (var entry in events.Value.EnumerateArray())
+        {
+            if (entry.ValueKind == JsonValueKind.String)
+            {
+                names.Add(entry.GetString()!);
+            }
+        }
+
+        return new WebhookEndpoint(
+            Json.RequireString(obj, "id", source),
+            Json.RequireString(obj, "accountId", source),
+            Json.RequireString(obj, "url", source),
+            names,
+            Json.RequireBool(obj, "active", source),
+            Json.RequireString(obj, "createdAt", source),
+            Json.RequireString(obj, "updatedAt", source));
+    }
 
     internal static EmbedToken EmbedToken(JsonElement obj, string source) =>
         new EmbedToken(Json.RequireString(obj, "token", source), Json.RequireString(obj, "expiresAt", source));

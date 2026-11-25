@@ -6,6 +6,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-11-25
+
+### Added
+
+- `SnapneditClient.GetAccountAsync()` — `GET /account`: the account id, email,
+  plan, credit balance and the calling key's id and `ApiKeyMode` (`Live` /
+  `Test`). Secret key only; an embed token is `Unauthorized`.
+- `SnapneditClient.ListJobsAsync(JobListQuery?)` — `GET /jobs?limit=N`: the
+  newest jobs first, each a `JobListItem` (`Job` as `GetJobAsync` reads it,
+  plus `CreatedAt`). `JobListQuery` takes `Limit` (1–100, default 20),
+  `Status` and the new `JobPriority` lane filter.
+- `SnapneditClient.WebhookEndpoints` — `ListAsync`, `CreateAsync(url, events?)`,
+  `SetActiveAsync(id, active)`, `DeleteAsync(id)` and `RotateSecretAsync(id)`
+  over `/webhook-endpoints`, with the `WebhookEndpoint` and
+  `WebhookEndpointCreated` models and the `WebhookEndpointEvents` constants.
+  Event names stay strings, so a newer type never breaks a read.
+- `JobEnvelope.Test` (inherited by `CreateJobResult`, `JobView`, `RunResult`)
+  and `WebhookEventData.Test` — true for a job made with an `sk_test_` key.
+  Read leniently: an older server that omits it reads as `false`.
+- The `session.ended` webhook: `WebhookEventType.SessionEnded` and
+  `WebhookEvent.Session` (`WebhookSessionEndedData`: session id, key, origin,
+  end user, start/end, refreshes, jobs, credits).
+- The `account.get`, `jobs.list`, `webhook-endpoints.crud` and
+  `keys.test-mode` conformance tests. The suite now implements all **29**
+  scenarios; the fixture reads `testApiKey` off the server's ready line.
+
+### Changed
+
+- `WebhookEvent.Data` is now nullable: it is `null` for an event that is not
+  about a job (`session.ended`, or an unknown type without a `jobId`), which
+  previously threw while parsing. Job events still always carry it.
+
 ## [0.1.1] — 2026-09-13
 
 ### Added

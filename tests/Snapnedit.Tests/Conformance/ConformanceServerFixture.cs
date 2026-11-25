@@ -188,6 +188,9 @@ public sealed class ConformanceServerFixture : IAsyncLifetime
     /// <summary>A secret <c>sk_live_</c> key for the seeded account.</summary>
     public string ApiKey { get; private set; } = string.Empty;
 
+    /// <summary>A secret <c>sk_test_</c> key on the same account: free jobs, placeholder results.</summary>
+    public string TestApiKey { get; private set; } = string.Empty;
+
     /// <summary>A <c>pk_live_</c> publishable key on the same account.</summary>
     public string PublishableKey { get; private set; } = string.Empty;
 
@@ -271,6 +274,7 @@ public sealed class ConformanceServerFixture : IAsyncLifetime
         var root0 = ready.RootElement;
         Url = root0.GetProperty("url").GetString()!;
         ApiKey = root0.GetProperty("apiKey").GetString()!;
+        TestApiKey = root0.GetProperty("testApiKey").GetString()!;
         PublishableKey = root0.GetProperty("publishableKey").GetString()!;
         WebhookSecret = root0.GetProperty("webhookSecret").GetString()!;
         AccountId = root0.GetProperty("accountId").GetString()!;

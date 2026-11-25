@@ -869,6 +869,157 @@ public sealed class ConformanceTests : IClassFixture<ConformanceServerFixture>
         Assert.Equal(committed, response.Text);
     }
 
+    /* ---------------- account & partner surface ---------------- */
+
+    [Fact(DisplayName = "account.get")]
+    public async Task AccountGet()
+    {
+        var me = await _fx.Api.GetAccountAsync();
+        Assert.Equal(_fx.AccountId, me.AccountId);
+        Assert.Equal(await BalanceAsync(), me.Credits);
+        Assert.Equal(ApiKeyMode.Live, me.Key.Mode);
+        Assert.NotEmpty(me.Key.Id);
+        Assert.NotNull(me.Plan);
+
+        using var testClient = _fx.NewClient(_fx.TestApiKey);
+        Assert.Equal(ApiKeyMode.Test, (await testClient.GetAccountAsync()).Key.Mode);
+
+        var none = await _fx.Anonymous.SendAsync("GET", "/account");
+        Assert.Equal(401, none.Status);
+        Assert.Equal("unauthorized", none.ErrorCode);
+
+        // Only a secret key may read the account — an embed token may not.
+        var minted = await _fx.Api.Embed.CreateSessionAsync(_fx.PublishableKey, "https://conformance.example");
+        using var asEmbed = _fx.NewClient(minted.Token);
+        var refused = await Assert.ThrowsAsync<SnapneditException>(() => asEmbed.GetAccountAsync());
+        Assert.Equal(ErrorCode.Unauthorized, refused.Code);
+        Assert.Equal(401, refused.Status);
+    }
+
+    [Fact(DisplayName = "jobs.list")]
+    public async Task JobsList()
+    {
+        var asset = await UniqueUploadAsync("jobs-list");
+        foreach (var width in new[] { 4, 5 })
+        {
+            var job = await _fx.Api.CreateJobAsync(
+                Operations.ResizeImage,
+                JobInput.FromAssetId(asset.AssetId),
+                new CreateJobOptions { TypedParams = new ResizeImageParams { Width = width } });
+            Assert.Equal(202, job.HttpStatus);
+            Assert.Equal(JobState.Succeeded, (await _fx.Api.WaitForJobAsync(job.JobId, FastWait())).State);
+        }
+
+        var list = await _fx.Api.ListJobsAsync(new JobListQuery { Limit = 2 });
+        Assert.Equal(2, list.Count);
+        var created = list.Select(j => DateTimeOffset.Parse(j.CreatedAt, CultureInfo.InvariantCulture)).ToList();
+        Assert.True(created[0] >= created[1], "the list is newest first");
+        Assert.All(list, j => Assert.NotEmpty(j.JobId));
+
+        // The wire carries the whole envelope on every item.
+        var raw = await _fx.Authenticated.SendAsync("GET", "/jobs?limit=2");
+        Assert.Equal(200, raw.Status);
+        foreach (var item in raw.Json.GetProperty("jobs").EnumerateArray())
+        {
+            foreach (var field in new[] { "jobId", "createdAt", "state", "input", "destination", "delivery", "creditCost", "cached", "deliveryOnly", "priority", "idempotencyKey", "test" })
+            {
+                Assert.True(item.TryGetProperty(field, out _), "list item is missing " + field);
+            }
+        }
+
+        var succeeded = await _fx.Api.ListJobsAsync(new JobListQuery { Limit = 1, Status = JobState.Succeeded });
+        Assert.True(succeeded.Count <= 1);
+        Assert.All(succeeded, j => Assert.Equal(JobState.Succeeded, j.Job.State));
+
+        foreach (var limit in new[] { 0, 101 })
+        {
+            var bad = await Assert.ThrowsAsync<SnapneditException>(() => _fx.Api.ListJobsAsync(new JobListQuery { Limit = limit }));
+            Assert.Equal(ErrorCode.InvalidInput, bad.Code);
+            Assert.Equal(400, bad.Status);
+        }
+
+        // Without a limit, GET /jobs is still the count.
+        var count = await _fx.Authenticated.SendAsync("GET", "/jobs");
+        Assert.Equal(200, count.Status);
+        Assert.Equal(new[] { "count", "priority", "status" }, TopLevelKeys(count.Json).OrderBy(k => k, StringComparer.Ordinal).ToArray());
+
+        Assert.Equal(401, (await _fx.Anonymous.SendAsync("GET", "/jobs?limit=1")).Status);
+    }
+
+    [Fact(DisplayName = "webhook-endpoints.crud")]
+    public async Task WebhookEndpointsCrud()
+    {
+        var created = await _fx.Api.WebhookEndpoints.CreateAsync("https://hooks.conformance.example/x");
+        var endpoint = created.Endpoint;
+        Assert.Equal(WebhookEndpointEvents.All, endpoint.Events);
+        Assert.True(endpoint.Active);
+        Assert.NotEmpty(created.Secret);
+
+        var list = await _fx.Api.WebhookEndpoints.ListAsync();
+        Assert.Contains(endpoint.Id, list.Select(e => e.Id));
+        var rawList = await _fx.Authenticated.SendAsync("GET", "/webhook-endpoints");
+        Assert.DoesNotContain(created.Secret, rawList.Text, StringComparison.Ordinal);
+
+        var paused = await _fx.Api.WebhookEndpoints.SetActiveAsync(endpoint.Id, false);
+        Assert.False(paused.Active);
+
+        var rotated = await _fx.Api.WebhookEndpoints.RotateSecretAsync(endpoint.Id);
+        Assert.NotEqual(created.Secret, rotated);
+
+        await _fx.Api.WebhookEndpoints.DeleteAsync(endpoint.Id);
+        var again = await Assert.ThrowsAsync<SnapneditException>(() => _fx.Api.WebhookEndpoints.DeleteAsync(endpoint.Id));
+        Assert.Equal(ErrorCode.NotFound, again.Code);
+        Assert.Equal(404, again.Status);
+
+        foreach (var (url, events) in new (string, string[]?)[]
+                 {
+                     ("http://hooks.conformance.example/x", null),
+                     ("https://10.0.0.1/x", null),
+                     ("https://hooks.conformance.example/x", new[] { "job.done" }),
+                 })
+        {
+            var bad = await Assert.ThrowsAsync<SnapneditException>(() => _fx.Api.WebhookEndpoints.CreateAsync(url, events));
+            Assert.Equal(ErrorCode.InvalidInput, bad.Code);
+            Assert.Equal(400, bad.Status);
+        }
+
+        Assert.Equal(401, (await _fx.Anonymous.SendAsync("GET", "/webhook-endpoints")).Status);
+    }
+
+    [Fact(DisplayName = "keys.test-mode")]
+    public async Task KeysTestMode()
+    {
+        using var testClient = _fx.NewClient(_fx.TestApiKey);
+        var before = await BalanceAsync();
+        var asset = await UniqueUploadAsync("test-mode");
+        var input = JobInput.FromAssetId(asset.AssetId);
+
+        var first = await testClient.CreateJobAsync(Operations.Upscale, input);
+        Assert.Equal(202, first.HttpStatus);
+        Assert.Equal(0, first.CreditCost);
+        Assert.False(first.Cached);
+        Assert.True(first.Test);
+        var done = await testClient.WaitForJobAsync(first.JobId, FastWait());
+        Assert.Equal(JobState.Succeeded, done.State);
+        Assert.True(done.Test);
+        Assert.NotNull(done.Status.Download);
+
+        // A test job never reads or seeds the result cache.
+        var second = await testClient.CreateJobAsync(Operations.Upscale, input);
+        Assert.Equal(202, second.HttpStatus);
+        Assert.False(second.Cached);
+        Assert.True(second.Test);
+
+        var live = await _fx.Api.CreateJobAsync(Operations.Upscale, input);
+        Assert.Equal(202, live.HttpStatus);
+        Assert.False(live.Cached);
+        Assert.False(live.Test);
+        Assert.Equal(Operations.CreditCosts[Operations.Upscale], live.CreditCost);
+        Assert.Equal(JobState.Succeeded, (await _fx.Api.WaitForJobAsync(live.JobId, FastWait())).State);
+
+        Assert.Equal(before - live.CreditCost, await BalanceAsync());
+    }
+
     /* ---------------- coverage ---------------- */
 
     [Fact(DisplayName = "every scenario in scenarios.json is implemented here")]
@@ -888,7 +1039,7 @@ public sealed class ConformanceTests : IClassFixture<ConformanceServerFixture>
             .ToArray();
 
         Assert.Equal(declared, implemented);
-        Assert.Equal(25, declared.Length);
+        Assert.Equal(29, declared.Length);
         Assert.Equal(1, _fx.Scenarios.GetProperty("version").GetInt32());
     }
 

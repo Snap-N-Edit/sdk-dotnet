@@ -13,6 +13,72 @@ public enum WebhookEventType
 
     /// <summary>An event type this package does not know. Treat it as a forward-compatible no-op, never as an error.</summary>
     Unknown = 2,
+
+    /// <summary><c>session.ended</c> — an embed session's last token expired. Read <see cref="WebhookEvent.Session"/>.</summary>
+    SessionEnded = 3,
+}
+
+/// <summary>The <c>data</c> object of a <c>session.ended</c> delivery: one per embed session, sent shortly after its last token expires.</summary>
+public sealed record WebhookSessionEndedData
+{
+    /// <summary>Creates session-ended data.</summary>
+    /// <param name="sessionId">The embed session id.</param>
+    /// <param name="apiKeyId">The publishable key the session was opened with, if any.</param>
+    /// <param name="origin">The host origin the editor was embedded on, if known.</param>
+    /// <param name="endUserId">The end-user id the host minted the token for, if any.</param>
+    /// <param name="startedAt">ISO-8601 timestamp the session opened.</param>
+    /// <param name="endedAt">ISO-8601 timestamp the session ended.</param>
+    /// <param name="refreshes">How many times the token was re-minted within the session.</param>
+    /// <param name="jobs">Jobs created in the session.</param>
+    /// <param name="credits">Credits those jobs debited.</param>
+    public WebhookSessionEndedData(
+        string sessionId,
+        string? apiKeyId,
+        string? origin,
+        string? endUserId,
+        string startedAt,
+        string endedAt,
+        int refreshes,
+        int jobs,
+        int credits)
+    {
+        SessionId = sessionId;
+        ApiKeyId = apiKeyId;
+        Origin = origin;
+        EndUserId = endUserId;
+        StartedAt = startedAt;
+        EndedAt = endedAt;
+        Refreshes = refreshes;
+        Jobs = jobs;
+        Credits = credits;
+    }
+
+    /// <summary>The embed session id.</summary>
+    public string SessionId { get; }
+
+    /// <summary>The publishable key the session was opened with, if any.</summary>
+    public string? ApiKeyId { get; }
+
+    /// <summary>The host origin the editor was embedded on, if known.</summary>
+    public string? Origin { get; }
+
+    /// <summary>The end-user id the host minted the token for, if any.</summary>
+    public string? EndUserId { get; }
+
+    /// <summary>ISO-8601 timestamp the session opened.</summary>
+    public string StartedAt { get; }
+
+    /// <summary>ISO-8601 timestamp the session ended.</summary>
+    public string EndedAt { get; }
+
+    /// <summary>How many times the token was re-minted within the session.</summary>
+    public int Refreshes { get; }
+
+    /// <summary>Jobs created in the session.</summary>
+    public int Jobs { get; }
+
+    /// <summary>Credits those jobs debited.</summary>
+    public int Credits { get; }
 }
 
 /// <summary>The <c>data</c> object inside a webhook delivery.</summary>
@@ -29,6 +95,7 @@ public sealed record WebhookEventData
     /// <param name="inputKind">Whether the input was an asset or a url.</param>
     /// <param name="destination">The destination summary, or <see langword="null"/>.</param>
     /// <param name="delivery">The delivery record, or <see langword="null"/>.</param>
+    /// <param name="test">Whether the job was made with an <c>sk_test_</c> key.</param>
     public WebhookEventData(
         string jobId,
         string operation,
@@ -39,7 +106,8 @@ public sealed record WebhookEventData
         string? message,
         JobInputKind inputKind,
         JobDestinationSummary? destination,
-        JobDelivery? delivery)
+        JobDelivery? delivery,
+        bool test = false)
     {
         JobId = jobId;
         Operation = operation;
@@ -51,6 +119,7 @@ public sealed record WebhookEventData
         InputKind = inputKind;
         Destination = destination;
         Delivery = delivery;
+        Test = test;
     }
 
     /// <summary>The job this event is about.</summary>
@@ -87,6 +156,9 @@ public sealed record WebhookEventData
     /// <see cref="Download"/>.
     /// </summary>
     public JobDelivery? Delivery { get; }
+
+    /// <summary>Whether the job was made with an <c>sk_test_</c> key (a placeholder result). False when not reported.</summary>
+    public bool Test { get; }
 }
 
 /// <summary>The full JSON body POSTed to a developer endpoint.</summary>
@@ -97,14 +169,22 @@ public sealed record WebhookEvent
     /// <param name="type">The event type, echoed in <c>X-Snapnedit-Event</c>.</param>
     /// <param name="rawType">The event type exactly as sent, including one this package does not know.</param>
     /// <param name="created">Unix seconds the event was created.</param>
-    /// <param name="data">The event payload.</param>
-    public WebhookEvent(string id, WebhookEventType type, string rawType, long created, WebhookEventData data)
+    /// <param name="data">The job payload, or <see langword="null"/> for an event that is not about a job.</param>
+    /// <param name="session">The <c>session.ended</c> payload, or <see langword="null"/>.</param>
+    public WebhookEvent(
+        string id,
+        WebhookEventType type,
+        string rawType,
+        long created,
+        WebhookEventData? data,
+        WebhookSessionEndedData? session = null)
     {
         Id = id;
         Type = type;
         RawType = rawType;
         Created = created;
         Data = data;
+        Session = session;
     }
 
     /// <summary>The delivery id, also sent as <c>X-Snapnedit-Delivery</c>.</summary>
@@ -119,8 +199,16 @@ public sealed record WebhookEvent
     /// <summary>Unix seconds the event was created.</summary>
     public long Created { get; }
 
-    /// <summary>The event payload.</summary>
-    public WebhookEventData Data { get; }
+    /// <summary>
+    /// The job payload, for <see cref="WebhookEventType.JobSucceeded"/> and
+    /// <see cref="WebhookEventType.JobFailed"/>. <see langword="null"/> for an
+    /// event that is not about a job (<c>session.ended</c>, or a newer type
+    /// without a <c>jobId</c>).
+    /// </summary>
+    public WebhookEventData? Data { get; }
+
+    /// <summary>The payload of a <see cref="WebhookEventType.SessionEnded"/> event; otherwise <see langword="null"/>.</summary>
+    public WebhookSessionEndedData? Session { get; }
 }
 
 /// <summary>Options for <see cref="SnapneditWebhooks.Verify(string, string, string, WebhookVerifyOptions?)"/>.</summary>

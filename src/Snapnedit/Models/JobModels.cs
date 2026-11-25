@@ -201,13 +201,15 @@ public record JobEnvelope
     /// <param name="creditCost">Credits actually debited for this job.</param>
     /// <param name="cached">Whether the result came out of the result cache.</param>
     /// <param name="deliveryOnly">Whether this row only delivers an already-cached result.</param>
+    /// <param name="test">Whether the job was made with an <c>sk_test_</c> key.</param>
     public JobEnvelope(
         JobInputKind inputKind,
         JobDestinationSummary? destination,
         JobDelivery? delivery,
         int creditCost = 0,
         bool cached = false,
-        bool deliveryOnly = false)
+        bool deliveryOnly = false,
+        bool test = false)
     {
         InputKind = inputKind;
         Destination = destination;
@@ -215,6 +217,7 @@ public record JobEnvelope
         CreditCost = creditCost;
         Cached = cached;
         DeliveryOnly = deliveryOnly;
+        Test = test;
     }
 
     /// <summary>Whether the job read its input from an uploaded asset or from a url.</summary>
@@ -248,6 +251,13 @@ public record JobEnvelope
     /// to your bucket is work the worker has yet to do.
     /// </summary>
     public bool DeliveryOnly { get; }
+
+    /// <summary>
+    /// Whether the job was created with an <c>sk_test_</c> key: free, never
+    /// cached, and its result is a placeholder image rather than a model run.
+    /// False when the api does not report it.
+    /// </summary>
+    public bool Test { get; }
 }
 
 /// <summary>What <c>GET /jobs/{id}</c> returns: the status, flattened, plus the envelope.</summary>
@@ -262,6 +272,7 @@ public sealed record JobView : JobEnvelope
     /// <param name="creditCost">Credits actually debited for this job.</param>
     /// <param name="cached">Whether the result came out of the result cache.</param>
     /// <param name="deliveryOnly">Whether this row only delivers an already-cached result.</param>
+    /// <param name="test">Whether the job was made with an <c>sk_test_</c> key.</param>
     public JobView(
         string jobId,
         JobStatus status,
@@ -270,8 +281,9 @@ public sealed record JobView : JobEnvelope
         JobDelivery? delivery,
         int creditCost = 0,
         bool cached = false,
-        bool deliveryOnly = false)
-        : base(inputKind, destination, delivery, creditCost, cached, deliveryOnly)
+        bool deliveryOnly = false,
+        bool test = false)
+        : base(inputKind, destination, delivery, creditCost, cached, deliveryOnly, test)
     {
         JobId = jobId;
         Status = status;
@@ -310,6 +322,7 @@ public sealed record CreateJobResult : JobEnvelope
     /// <param name="creditCost">Credits actually debited for this job.</param>
     /// <param name="cached">Whether the result came out of the result cache.</param>
     /// <param name="deliveryOnly">Whether this row only delivers an already-cached result.</param>
+    /// <param name="test">Whether the job was made with an <c>sk_test_</c> key.</param>
     public CreateJobResult(
         string jobId,
         JobStatus status,
@@ -319,8 +332,9 @@ public sealed record CreateJobResult : JobEnvelope
         JobDelivery? delivery,
         int creditCost = 0,
         bool cached = false,
-        bool deliveryOnly = false)
-        : base(inputKind, destination, delivery, creditCost, cached, deliveryOnly)
+        bool deliveryOnly = false,
+        bool test = false)
+        : base(inputKind, destination, delivery, creditCost, cached, deliveryOnly, test)
     {
         JobId = jobId;
         Status = status;
@@ -347,7 +361,7 @@ public sealed record CreateJobResult : JobEnvelope
     /// <summary>A <see cref="JobView"/> over the same data, for code that wants one shape.</summary>
     /// <returns>The equivalent job view.</returns>
     public JobView ToJobView() =>
-        new JobView(JobId, Status, InputKind, Destination, Delivery, CreditCost, Cached, DeliveryOnly);
+        new JobView(JobId, Status, InputKind, Destination, Delivery, CreditCost, Cached, DeliveryOnly, Test);
 }
 
 /// <summary>What <see cref="SnapneditClient.RunAsync"/> resolves to.</summary>
@@ -366,6 +380,7 @@ public sealed record RunResult : JobEnvelope
     /// <param name="creditCost">Credits actually debited for the job.</param>
     /// <param name="cached">Whether the result came out of the result cache.</param>
     /// <param name="deliveryOnly">Whether the job only delivered an already-cached result.</param>
+    /// <param name="test">Whether the job was made with an <c>sk_test_</c> key.</param>
     public RunResult(
         string jobId,
         bool downloaded,
@@ -378,8 +393,9 @@ public sealed record RunResult : JobEnvelope
         JobDelivery? delivery,
         int creditCost = 0,
         bool cached = false,
-        bool deliveryOnly = false)
-        : base(inputKind, destination, delivery, creditCost, cached, deliveryOnly)
+        bool deliveryOnly = false,
+        bool test = false)
+        : base(inputKind, destination, delivery, creditCost, cached, deliveryOnly, test)
     {
         JobId = jobId;
         Downloaded = downloaded;

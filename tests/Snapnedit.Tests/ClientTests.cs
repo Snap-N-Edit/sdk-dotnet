@@ -771,4 +771,99 @@ public sealed class ClientTests
         Assert.False(result.Cached);
         Assert.False(result.DeliveryOnly);
     }
+
+    [Fact]
+    public async Task GetAccountAsync_reads_the_account_and_the_keys_mode()
+    {
+        var handler = new FakeHttpMessageHandler(FakeHttpMessageHandler.Json(
+            HttpStatusCode.OK,
+            "{\"accountId\":\"acct-1\",\"email\":null,\"plan\":\"free\",\"credits\":42,\"key\":{\"id\":\"key-1\",\"mode\":\"test\"}}"));
+        using var client = Build(handler);
+
+        var account = await client.GetAccountAsync();
+
+        Assert.Equal("https://api.example.test/account", handler.Urls[0]);
+        Assert.Equal("acct-1", account.AccountId);
+        Assert.Null(account.Email);
+        Assert.Equal("free", account.Plan);
+        Assert.Equal(42, account.Credits);
+        Assert.Equal("key-1", account.Key.Id);
+        Assert.Equal(ApiKeyMode.Test, account.Key.Mode);
+    }
+
+    [Fact]
+    public async Task ListJobsAsync_always_sends_a_limit_and_reads_each_item_as_a_job_view()
+    {
+        const string Body = "{\"jobs\":[{\"jobId\":\"job-2\",\"createdAt\":\"2026-11-25T10:00:01.000Z\",\"state\":\"succeeded\"," +
+                            "\"outputAssetId\":\"out-2\",\"download\":null,\"input\":{\"kind\":\"asset\"},\"destination\":null," +
+                            "\"delivery\":null,\"creditCost\":0,\"cached\":false,\"deliveryOnly\":false,\"test\":true}," +
+                            "{\"jobId\":\"job-1\",\"createdAt\":\"2026-11-25T10:00:00.000Z\",\"state\":\"queued\"," +
+                            "\"input\":{\"kind\":\"url\"},\"destination\":null,\"delivery\":null}]}";
+        var handler = new FakeHttpMessageHandler(
+            FakeHttpMessageHandler.Json(HttpStatusCode.OK, Body),
+            FakeHttpMessageHandler.Json(HttpStatusCode.OK, "{\"jobs\":[]}"));
+        using var client = Build(handler);
+
+        var jobs = await client.ListJobsAsync();
+        await client.ListJobsAsync(new JobListQuery { Limit = 5, Status = JobState.Succeeded, Priority = JobPriority.Background });
+
+        Assert.Equal("https://api.example.test/jobs?limit=20", handler.Urls[0]);
+        Assert.Equal("https://api.example.test/jobs?limit=5&status=succeeded&priority=background", handler.Urls[1]);
+        Assert.Equal(new[] { "job-2", "job-1" }, jobs.Select(j => j.JobId).ToArray());
+        Assert.Equal(JobState.Succeeded, jobs[0].Job.State);
+        Assert.True(jobs[0].Job.Test);
+        Assert.Equal("2026-11-25T10:00:01.000Z", jobs[0].CreatedAt);
+        // An item from an older server, with no `test`, reads as live.
+        Assert.False(jobs[1].Job.Test);
+        Assert.Equal(JobInputKind.Url, jobs[1].Job.InputKind);
+    }
+
+    [Fact]
+    public async Task Webhook_endpoints_are_managed_at_webhook_endpoints()
+    {
+        const string Endpoint = "{\"id\":\"we-1\",\"accountId\":\"acct-1\",\"url\":\"https://hooks.example/x\"," +
+                                "\"events\":[\"job.succeeded\",\"some.future-event\"],\"active\":false," +
+                                "\"createdAt\":\"t\",\"updatedAt\":\"t\"}";
+        var handler = new FakeHttpMessageHandler(
+            FakeHttpMessageHandler.Json(HttpStatusCode.Created, "{\"endpoint\":" + Endpoint + ",\"secret\":\"whsec_1\"}"),
+            FakeHttpMessageHandler.Json(HttpStatusCode.OK, "{\"endpoints\":[" + Endpoint + "]}"),
+            FakeHttpMessageHandler.Json(HttpStatusCode.OK, "{\"endpoint\":" + Endpoint + "}"),
+            FakeHttpMessageHandler.Json(HttpStatusCode.OK, "{\"secret\":\"whsec_2\"}"),
+            FakeHttpMessageHandler.Empty(HttpStatusCode.NoContent));
+        using var client = Build(handler);
+
+        var created = await client.WebhookEndpoints.CreateAsync("https://hooks.example/x", new[] { WebhookEndpointEvents.JobSucceeded });
+        var list = await client.WebhookEndpoints.ListAsync();
+        var paused = await client.WebhookEndpoints.SetActiveAsync("we-1", false);
+        var rotated = await client.WebhookEndpoints.RotateSecretAsync("we-1");
+        await client.WebhookEndpoints.DeleteAsync("we-1");
+
+        Assert.Equal("whsec_1", created.Secret);
+        Assert.Equal("we-1", created.Endpoint.Id);
+        Assert.Equal("{\"url\":\"https://hooks.example/x\",\"events\":[\"job.succeeded\"]}", handler.Requests[0].Body);
+        // An event type newer than this package is kept, not dropped or thrown on.
+        Assert.Equal(new[] { "job.succeeded", "some.future-event" }, list.Single().Events.ToArray());
+        Assert.Equal("PATCH", handler.Requests[2].Method);
+        Assert.Equal("{\"active\":false}", handler.Requests[2].Body);
+        Assert.False(paused.Active);
+        Assert.Equal("whsec_2", rotated);
+        Assert.Equal("https://api.example.test/webhook-endpoints/we-1/rotate", handler.Urls[3]);
+        Assert.Equal("DELETE", handler.Requests[4].Method);
+        Assert.Equal("https://api.example.test/webhook-endpoints/we-1", handler.Urls[4]);
+    }
+
+    [Fact]
+    public async Task CreateWebhookEndpoint_without_events_omits_the_field()
+    {
+        var handler = new FakeHttpMessageHandler(FakeHttpMessageHandler.Json(
+            HttpStatusCode.Created,
+            "{\"endpoint\":{\"id\":\"we-1\",\"accountId\":\"a\",\"url\":\"https://h.example/x\",\"events\":[\"job.succeeded\",\"job.failed\",\"session.ended\"]," +
+            "\"active\":true,\"createdAt\":\"t\",\"updatedAt\":\"t\"},\"secret\":\"s\"}"));
+        using var client = Build(handler);
+
+        var created = await client.WebhookEndpoints.CreateAsync("https://h.example/x");
+
+        Assert.Equal("{\"url\":\"https://h.example/x\"}", handler.Requests[0].Body);
+        Assert.Equal(WebhookEndpointEvents.All, created.Endpoint.Events);
+    }
 }

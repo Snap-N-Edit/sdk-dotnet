@@ -227,10 +227,46 @@ Two things to know before writing an assertion against these numbers:
 
 ---
 
+## Account, recent jobs and test keys
+
+```csharp
+var me = await client.GetAccountAsync();          // secret key only
+Console.WriteLine($"{me.AccountId}: {me.Credits} credits on {me.Plan}, key {me.Key.Id} is {me.Key.Mode}");
+
+var recent = await client.ListJobsAsync(new JobListQuery { Limit = 10, Status = JobState.Failed });
+foreach (var item in recent)                      // newest first
+{
+    Console.WriteLine($"{item.CreatedAt} {item.JobId} {item.Job.State} test={item.Job.Test}");
+}
+```
+
+`ListJobsAsync` defaults to the 20 newest jobs; `Limit` must be 1–100.
+
+An **`sk_test_` key** runs jobs for free: they never touch the result cache,
+their result is a placeholder image rather than a model run, and every job
+envelope says so with `Test == true` (`false` on a live key, and on a server
+that predates the field). A test key is capped at 50 jobs a day.
+
+---
+
 ## Webhooks (ASP.NET Core)
 
 Register an endpoint URL on your account and it receives a signed POST every
-time a job finishes. Verify the **raw body**, before any JSON parse.
+time a job finishes (and when an embed session ends):
+
+```csharp
+var created = await client.WebhookEndpoints.CreateAsync(
+    "https://example.com/webhooks/snapnedit",
+    new[] { WebhookEndpointEvents.JobSucceeded, WebhookEndpointEvents.JobFailed }); // omit for all events
+var secret = created.Secret;   // shown ONCE — store it now
+
+await client.WebhookEndpoints.SetActiveAsync(created.Endpoint.Id, false);    // pause
+var rotated = await client.WebhookEndpoints.RotateSecretAsync(created.Endpoint.Id);
+await client.WebhookEndpoints.DeleteAsync(created.Endpoint.Id);
+```
+
+`WebhookEndpoints.ListAsync()` returns every endpoint — never a secret.
+Verify each delivery against the **raw body**, before any JSON parse.
 
 ```csharp
 var builder = WebApplication.CreateBuilder(args);
@@ -261,10 +297,13 @@ app.MapPost("/webhooks/snapnedit", async (HttpRequest request) =>
     switch (evt.Type)
     {
         case WebhookEventType.JobSucceeded:
-            Console.WriteLine($"{evt.Data.JobId} → {evt.Data.OutputAssetId}");
+            Console.WriteLine($"{evt.Data!.JobId} → {evt.Data.OutputAssetId}");
             break;
         case WebhookEventType.JobFailed:
-            Console.WriteLine($"{evt.Data.JobId} failed: {evt.Data.ErrorCode}");
+            Console.WriteLine($"{evt.Data!.JobId} failed: {evt.Data.ErrorCode}");
+            break;
+        case WebhookEventType.SessionEnded:
+            Console.WriteLine($"session {evt.Session!.SessionId}: {evt.Session.Jobs} jobs, {evt.Session.Credits} credits");
             break;
         default:
             break;                                          // forward-compatible no-op
@@ -406,6 +445,9 @@ runtime.
 | `UploadAsync(bytes\|JobInput, mime?, ct)` | `POST /uploads` → PUT → confirm. |
 | `ListOperationsAsync(ct)` | The live operation catalog. |
 | `GetUsageAsync(query?, ct)` | Jobs, credits and embed sessions over a range, bucketed. |
+| `GetAccountAsync(ct)` | The account, its balance and the key's live/test mode. |
+| `ListJobsAsync(query?, ct)` | The newest jobs, each with its full envelope. |
+| `WebhookEndpoints.{List,Create,SetActive,Delete,RotateSecret}Async` | Webhook endpoint management. |
 | `Destinations.{List,Create,Update,Delete,Test,PresignUpload}Async` | Saved storage destinations. |
 | `Embed.{CreateSession,CreateToken}Async` | Embedded-editor tokens. |
 | `Designs.{Create,CreatePages,Render}Async` | Server-side design composition and rendering. |
@@ -426,7 +468,7 @@ dotnet pack -c Release
 
 The **conformance suite** is one test per scenario in the monorepo's
 `test/conformance/scenarios.json` — the language-neutral contract every
-snapnedit SDK is held to, all 25 of them. Each test is named with its scenario
+snapnedit SDK is held to, all 29 of them. Each test is named with its scenario
 id, so a changed scenario is a `grep` away from its test. The fixture boots
 `node scripts/conformance-server.mjs` from the repo root (the real Fastify API
 and the real worker, in one process, on an ephemeral port) and terminates it

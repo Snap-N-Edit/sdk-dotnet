@@ -165,32 +165,58 @@ public static class SnapneditWebhooks
             }
 
             var rawType = Json.RequireString(root, "type", Source);
-            var status = Json.OptionalString(data.Value, "status");
-            var envelope = ApiParse.JobEnvelope(data.Value);
+            var type = rawType switch
+            {
+                "job.succeeded" => WebhookEventType.JobSucceeded,
+                "job.failed" => WebhookEventType.JobFailed,
+                "session.ended" => WebhookEventType.SessionEnded,
+                _ => WebhookEventType.Unknown,
+            };
 
-            var eventData = new WebhookEventData(
-                Json.RequireString(data.Value, "jobId", Source),
-                Json.RequireString(data.Value, "operation", Source),
-                status == "failed" ? JobState.Failed : JobState.Succeeded,
-                Json.OptionalString(data.Value, "outputAssetId"),
-                Json.OptionalString(data.Value, "download"),
-                status == "failed" ? ErrorCodes.Parse(Json.OptionalString(data.Value, "errorCode")) : (ErrorCode?)null,
-                Json.OptionalString(data.Value, "message"),
-                envelope.InputKind,
-                envelope.Destination,
-                envelope.Delivery);
+            // Job fields are required on a job event; an unknown type is only
+            // read as a job when it carries a jobId, so a new event never throws.
+            WebhookEventData? eventData = null;
+            if (type is WebhookEventType.JobSucceeded or WebhookEventType.JobFailed ||
+                (type == WebhookEventType.Unknown && Json.OptionalString(data.Value, "jobId") is not null))
+            {
+                var status = Json.OptionalString(data.Value, "status");
+                var envelope = ApiParse.JobEnvelope(data.Value);
+                eventData = new WebhookEventData(
+                    Json.RequireString(data.Value, "jobId", Source),
+                    Json.RequireString(data.Value, "operation", Source),
+                    status == "failed" ? JobState.Failed : JobState.Succeeded,
+                    Json.OptionalString(data.Value, "outputAssetId"),
+                    Json.OptionalString(data.Value, "download"),
+                    status == "failed" ? ErrorCodes.Parse(Json.OptionalString(data.Value, "errorCode")) : (ErrorCode?)null,
+                    Json.OptionalString(data.Value, "message"),
+                    envelope.InputKind,
+                    envelope.Destination,
+                    envelope.Delivery,
+                    envelope.Test);
+            }
+
+            WebhookSessionEndedData? session = null;
+            if (type == WebhookEventType.SessionEnded)
+            {
+                session = new WebhookSessionEndedData(
+                    Json.RequireString(data.Value, "sessionId", Source),
+                    Json.OptionalString(data.Value, "apiKeyId"),
+                    Json.OptionalString(data.Value, "origin"),
+                    Json.OptionalString(data.Value, "endUserId"),
+                    Json.RequireString(data.Value, "startedAt", Source),
+                    Json.RequireString(data.Value, "endedAt", Source),
+                    Json.OptionalInt(data.Value, "refreshes") ?? 0,
+                    Json.OptionalInt(data.Value, "jobs") ?? 0,
+                    Json.OptionalInt(data.Value, "credits") ?? 0);
+            }
 
             return new WebhookEvent(
                 Json.RequireString(root, "id", Source),
-                rawType switch
-                {
-                    "job.succeeded" => WebhookEventType.JobSucceeded,
-                    "job.failed" => WebhookEventType.JobFailed,
-                    _ => WebhookEventType.Unknown,
-                },
+                type,
                 rawType,
                 Json.OptionalLong(root, "created") ?? 0L,
-                eventData);
+                eventData,
+                session);
         }
     }
 

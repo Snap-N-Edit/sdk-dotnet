@@ -83,13 +83,13 @@ public sealed class WebhookTests
         Assert.Equal("whd_00000000-0000-4000-8000-000000000001", evt.Id);
         Assert.Equal(WebhookEventType.JobSucceeded, evt.Type);
         Assert.Equal(1700000000L, evt.Created);
-        Assert.Equal("9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d", evt.Data.JobId);
-        Assert.Equal(Operations.RemoveBackground, evt.Data.Operation);
-        Assert.Equal(JobState.Succeeded, evt.Data.State);
-        Assert.Equal("3f2504e0-4f89-41d3-9a0c-0305e82c3301", evt.Data.OutputAssetId);
-        Assert.Equal(JobInputKind.Asset, evt.Data.InputKind);
-        Assert.Null(evt.Data.Destination);
-        Assert.Null(evt.Data.Delivery);
+        Assert.Equal("9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d", evt.Data!.JobId);
+        Assert.Equal(Operations.RemoveBackground, evt.Data!.Operation);
+        Assert.Equal(JobState.Succeeded, evt.Data!.State);
+        Assert.Equal("3f2504e0-4f89-41d3-9a0c-0305e82c3301", evt.Data!.OutputAssetId);
+        Assert.Equal(JobInputKind.Asset, evt.Data!.InputKind);
+        Assert.Null(evt.Data!.Destination);
+        Assert.Null(evt.Data!.Delivery);
     }
 
     [Fact]
@@ -111,9 +111,9 @@ public sealed class WebhookTests
         var evt = SnapneditWebhooks.Parse(Body);
 
         Assert.Equal(WebhookEventType.JobFailed, evt.Type);
-        Assert.Equal(JobState.Failed, evt.Data.State);
-        Assert.Equal(ErrorCode.InputFetchFailed, evt.Data.ErrorCode);
-        Assert.Equal(JobInputKind.Url, evt.Data.InputKind);
+        Assert.Equal(JobState.Failed, evt.Data!.State);
+        Assert.Equal(ErrorCode.InputFetchFailed, evt.Data!.ErrorCode);
+        Assert.Equal(JobInputKind.Url, evt.Data!.InputKind);
     }
 
     [Fact]
@@ -129,9 +129,48 @@ public sealed class WebhookTests
         Assert.Equal(WebhookEventType.Unknown, evt.Type);
         Assert.Equal("job.something-new", evt.RawType);
         // succeeded + a FAILED delivery is a real combination, not a contradiction.
-        Assert.Equal(JobState.Succeeded, evt.Data.State);
-        Assert.Equal(JobDeliveryStatus.Failed, evt.Data.Delivery!.Status);
-        Assert.Equal("d", evt.Data.Destination!.Id);
+        Assert.Equal(JobState.Succeeded, evt.Data!.State);
+        Assert.Equal(JobDeliveryStatus.Failed, evt.Data!.Delivery!.Status);
+        Assert.Equal("d", evt.Data!.Destination!.Id);
+    }
+
+    [Fact]
+    public void A_session_ended_event_carries_the_session_and_no_job()
+    {
+        const string Body = "{\"id\":\"whd_3\",\"type\":\"session.ended\",\"created\":2,\"data\":{\"status\":\"ended\"," +
+                            "\"sessionId\":\"s1\",\"apiKeyId\":\"k1\",\"origin\":\"https://host.example\",\"endUserId\":null," +
+                            "\"startedAt\":\"2026-11-25T10:00:00.000Z\",\"endedAt\":\"2026-11-25T11:00:00.000Z\"," +
+                            "\"refreshes\":3,\"jobs\":7,\"credits\":9}}";
+
+        var evt = SnapneditWebhooks.Parse(Body);
+
+        Assert.Equal(WebhookEventType.SessionEnded, evt.Type);
+        Assert.Null(evt.Data);
+        Assert.Equal("s1", evt.Session!.SessionId);
+        Assert.Equal("k1", evt.Session.ApiKeyId);
+        Assert.Null(evt.Session.EndUserId);
+        Assert.Equal(3, evt.Session.Refreshes);
+        Assert.Equal(7, evt.Session.Jobs);
+        Assert.Equal(9, evt.Session.Credits);
+    }
+
+    [Fact]
+    public void An_unknown_event_that_is_not_about_a_job_does_not_throw()
+    {
+        var evt = SnapneditWebhooks.Parse("{\"id\":\"whd_4\",\"type\":\"account.updated\",\"created\":3,\"data\":{\"plan\":\"pro\"}}");
+
+        Assert.Equal(WebhookEventType.Unknown, evt.Type);
+        Assert.Null(evt.Data);
+        Assert.Null(evt.Session);
+    }
+
+    [Fact]
+    public void A_test_job_event_reports_test()
+    {
+        var evt = SnapneditWebhooks.Parse(RawBody.Replace("\"delivery\":null}", "\"delivery\":null,\"test\":true}"));
+
+        Assert.True(evt.Data!.Test);
+        Assert.False(SnapneditWebhooks.Parse(RawBody).Data!.Test);
     }
 
     [Fact]
